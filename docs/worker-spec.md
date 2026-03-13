@@ -100,9 +100,6 @@
   - **各ランク当選確率** (`card.supply_amount / oripa.supply`)
     - ランクごとの総枚数・確率%・代表カード名を算出
     - 1等+2等合計確率も算出
-- 外部相場（任意）:
-  - Yahoo!オークション検索の価格サマリ
-  - `min/max/median/average/sampleCount`
 
 ### パターン
 
@@ -116,7 +113,6 @@
 
 - `forcePattern` 指定時はそのパターン固定
 - `urgency` は低在庫率時のみ有効（通常は強制回避）
-- 外部相場が取れない場合は `market_analysis` から自動切替
 
 ### 投稿文の冒頭ルール
 
@@ -189,6 +185,33 @@
   - `/?mode=tcg_daily&pick_offset=3`
 - サンプル一覧:
   - `/?mode=tcg_samples&count=5`
+- price_spike プレビュー:
+  - `/?mode=price_spike`（POST JSON / `commit` なし）
+- price_spike 実投稿:
+  - `/?mode=price_spike&commit=1`（POST JSON）
+
+## 機能4: price_spike 投稿
+
+- リクエストJSON:
+  - `source: string`
+  - `spikes: [{ card, before, after, change_pct, fetched_at, period? }]`
+- `spikes` の先頭1件のみ処理
+- 重複抑止:
+  - KVキー `price_spike:{card}`
+  - 既に存在する場合は `skipped: true` で終了
+  - 実投稿成功時のみTTL 21600秒（6時間）で記録
+- 投稿文:
+  - Anthropic 生成（失敗時はフォールバック文）
+  - 人格: ポケカ好きな情報通が、相場の動きをさらっと共有するトーン
+  - 構成:
+    - 1行目: `カード名 + {period}で+{変化率}%`
+      - `period` 未指定時は `直近` を使う（例: `直近で+8.08%`）
+    - 2行目: `{前回価格}円 → {現在価格}円（+{変化率}%）`
+    - 3行目: 背景の推察をやわらかく一文
+    - URLは付与しない（市場情報のみ）
+  - `#ポケカ` 固定
+  - 60〜100文字
+  - 煽り/主観/根拠なし予測を禁止
 
 ## 必要な環境変数/Secrets
 
