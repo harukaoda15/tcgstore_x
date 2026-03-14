@@ -31,11 +31,15 @@ type DailyTcgPreviewOptions = {
 
 type PriceSpikeItem = {
 	card: string;
+	variant?: string;
+	card_id?: string;
 	before: number;
 	after: number;
 	change_pct: number;
 	fetched_at: string;
 	period?: string;
+	source_site?: string;
+	source_url?: string;
 };
 
 type PriceSpikePayload = {
@@ -113,10 +117,12 @@ type StateStore = {
 
 const localStateFallback = new Map<string, string>();
 const TCGSTORE_LAST_URL_KEY = "last_oripa_url";
-const TCGSTORE_HISTORY_KEY = "oripa_url_history";
 const MERCARI_LAST_URL_KEY = "last_mercari_url";
-const MERCARI_HISTORY_KEY = "mercari_url_history";
-const HISTORY_SIZE = 5;
+const TCGSTORE_RECENT_URLS_KEY = "recent_oripa_urls";
+const MERCARI_RECENT_URLS_KEY = "recent_mercari_urls";
+const DAILY_LAST_SOURCE_KEY = "last_daily_source";
+const LATEST_MARKET_CONTEXT_KEY = "latest_market_context";
+const DAILY_RECENT_HISTORY_LIMIT = 10;
 const DAILY_AI_PATTERN_ORDER: DailyAiPattern[] = [
 	"market_analysis",
 	"contrarian",
@@ -149,7 +155,7 @@ const TCGSTORE_AI_SYSTEM_PROMPT = `あなたはTCGSTOREの公式Xアカウント
 - 投資勧誘と取られる表現は禁止（「絶対上がる」「買うべき」など）
 - 与えられた情報以外の事実を断定しない
 - ハッシュタグは0〜2個まで
-- 絵文字は toneMode=calm の時は0〜1個、toneMode=hype の時は1〜3個。使うなら先頭に置く
+- 絵文字は0〜1個まで。使う場合も装飾目的の連打は禁止
 - 商品リンクは最後に1回だけ配置する
 - 毎回異なる切り口で書く。同じフレーズの繰り返し禁止
 - URL以外の行頭記号や箇条書きは使わない
@@ -175,6 +181,13 @@ const PRICE_SPIKE_SYSTEM_PROMPT = `あなたはポケカ好きな情報通。市
 - 数字は正確に
 - 温度はあるが煽らない
 - 断定予測はしない`;
+
+const MERCARI_DAILY_AI_SYSTEM_PROMPT = `あなたはTCGSTOREのX運用担当。
+メルカリくじの紹介投稿を作るが、広告っぽさよりも「読む価値」を優先する。
+- 派手な絵文字連打は禁止
+- 事実ベースで短くわかりやすく
+- 行き過ぎた煽りは禁止
+- URLは末尾に1回だけ`;
 
 export default {
 	async fetch(request: Request, env: MonitorEnv): Promise<Response> {
@@ -274,6 +287,8 @@ async function runDailyTcgStoreSpotlight(
 	} = options;
 	const stateStore = createStateStore(env);
 	const excludeSet = new Set(excludeUnits.map((u) => u.toLowerCase()));
+	const marketContext = await getLatestMarketContext(stateStore);
+	const marketContext = await getLatestMarketContext(stateStore);
 
 	const candidates = await fetchTcgStoreOripaCandidates();
 	const validCandidates = candidates.filter((item) => {
@@ -298,30 +313,23 @@ async function runDailyTcgStoreSpotlight(
 		return result;
 	}
 
-	const historyRaw = await stateStore.get(TCGSTORE_HISTORY_KEY);
-	const recentUrls: string[] = historyRaw ? JSON.parse(historyRaw) : [];
-	// 後方互換: 旧キーの値もhistoryに含める
-	const legacyUrl = await stateStore.get(TCGSTORE_LAST_URL_KEY);
-	if (legacyUrl && !recentUrls.includes(legacyUrl)) recentUrls.push(legacyUrl);
-
+	const prioritizedCandidates = prioritizeCandidatesByMarketContext(validCandidates, marketContext);
+	const selectionCandidates = prioritizedCandidates.length > 0 ? prioritizedCandidates : validCandidates;
+	const lastUrl = await stateStore.get(TCGSTORE_LAST_URL_KEY);
+	const recentUrls = await getRecentUrlHistory(stateStore, TCGSTORE_RECENT_URLS_KEY);
 	const dateSeed = getJstDateSeed();
+	const slotSeed = getJstSlotSeed();
 
-	let selectedIndex = dateSeed % validCandidates.length;
-	// 直近HISTORY_SIZE件に含まれる場合は次の候補へ（全周して見つからなければそのまま）
-	if (validCandidates.length > 1) {
-		for (let i = 0; i < validCandidates.length; i++) {
-			const idx = (selectedIndex + i) % validCandidates.length;
-			if (!recentUrls.includes(validCandidates[idx].url)) {
-				selectedIndex = idx;
-				break;
-			}
-		}
-	}
-	if (pickOffset !== 0) {
-		selectedIndex = (selectedIndex + pickOffset + validCandidates.length) % validCandidates.length;
-	}
+	let selectedIndex = pickIndexWithHistoryGuard({
+		size: selectionCandidates.length,
+		seed: dateSeed + slotSeed,
+		pickOffset,
+		urlAt: (index) => selectionCandidates[index]?.url ?? "",
+		lastUrl,
+		recentUrls,
+	});
 
-	const selected = validCandidates[selectedIndex];
+	const selected = selectionCandidates[selectedIndex];
 	const selectedDetail = await fetchTcgStoreOripaDetail(selected.id);
 	const selectedWithDetail: TcgStoreOripaCandidate = {
 		...selected,
@@ -329,7 +337,7 @@ async function runDailyTcgStoreSpotlight(
 	};
 	const messageResult = await buildDailyTcgStorePostMessage({
 		selected: selectedWithDetail,
-		validCandidates,
+		validCandidates: selectionCandidates,
 		dateSeed,
 		env,
 		forcePattern,
@@ -341,6 +349,20 @@ async function runDailyTcgStoreSpotlight(
 			rankProbabilities: selectedDetail.rankProbabilities,
 		},
 	});
+	if (!messageResult.aiUsed || !messageResult.message) {
+		const result = {
+			ok: false,
+			reason: "tcg_ai_failed",
+			fromSchedule,
+			commitMode: commit,
+			source: "tcgstore",
+			selected: { title: selected.name, url: selected.url },
+			aiReason: messageResult.reason,
+			marketContext,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "TCG_DAILY_SKIP_AI", ...result }, null, 2));
+		return result;
+	}
 	const message = messageResult.message;
 
 	let postedToX = false;
@@ -360,8 +382,7 @@ async function runDailyTcgStoreSpotlight(
 		xResponse = postResult;
 		if (postResult.ok) {
 			await stateStore.put(TCGSTORE_LAST_URL_KEY, selected.url);
-			const newHistory = [selected.url, ...recentUrls].slice(0, HISTORY_SIZE);
-			await stateStore.put(TCGSTORE_HISTORY_KEY, JSON.stringify(newHistory));
+			await appendRecentUrlHistory(stateStore, TCGSTORE_RECENT_URLS_KEY, selected.url);
 			committed = true;
 		}
 	}
@@ -370,7 +391,8 @@ async function runDailyTcgStoreSpotlight(
 		ok: true,
 		fromSchedule,
 		commitMode: commit,
-		candidateCount: validCandidates.length,
+		candidateCount: selectionCandidates.length,
+		baseCandidateCount: validCandidates.length,
 		selectedIndex,
 		selected: {
 			title: selected.name,
@@ -392,7 +414,9 @@ async function runDailyTcgStoreSpotlight(
 			maxCoinPrize: selectedDetail.maxCoinPrize,
 			rankProbabilities: selectedDetail.rankProbabilities,
 		},
-		lastPostedUrl: recentUrls[0] ?? null,
+		lastPostedUrl: lastUrl,
+		recentPostedUrls: recentUrls,
+		marketContext,
 		previewMessage: message,
 		aiUsed: messageResult.aiUsed,
 		aiPattern: messageResult.pattern,
@@ -419,19 +443,31 @@ async function runDailyRandomSpotlight(
 	options: { commit?: boolean; logToConsole?: boolean; fromSchedule?: boolean } = {},
 ): Promise<Record<string, unknown>> {
 	const { commit = false, logToConsole = true, fromSchedule = false } = options;
-	const dateSeed = getJstDateSeed();
-	const preferredSource = pickDailySpotlightSource(dateSeed);
+	const stateStore = createStateStore(env);
+	const slotSeed = getJstSlotSeed();
+	const lastSource = await stateStore.get(DAILY_LAST_SOURCE_KEY);
+	const seededSource = pickDailySpotlightSource(slotSeed);
+	const preferredSource =
+		lastSource === "mercari" || lastSource === "tcgstore"
+			? seededSource === lastSource
+				? invertDailySpotlightSource(lastSource)
+				: seededSource
+			: seededSource;
 	const first =
 		preferredSource === "mercari"
 			? await runDailyMercariSpotlight(env, { commit, logToConsole, fromSchedule })
 			: await runDailyTcgStoreSpotlight(env, { commit, logToConsole, fromSchedule });
 	if (first.ok) {
+		const postedSource = preferredSource;
+		if (commit && Boolean((first as Record<string, unknown>).committed)) {
+			await stateStore.put(DAILY_LAST_SOURCE_KEY, postedSource);
+		}
 		const result = { ok: true, selectedSource: preferredSource, primary: first, fallbackUsed: false };
 		if (logToConsole) console.log(JSON.stringify({ type: "DAILY_RANDOM_RESULT", ...result }, null, 2));
 		return result;
 	}
 	const reason = String(first.reason ?? "");
-	const canFallback = reason === "no_candidates";
+	const canFallback = reason === "no_candidates" || reason === "tcg_ai_failed" || reason === "mercari_ai_failed";
 	if (!canFallback) {
 		const result = {
 			ok: false,
@@ -447,6 +483,10 @@ async function runDailyRandomSpotlight(
 		preferredSource === "mercari"
 			? await runDailyTcgStoreSpotlight(env, { commit, logToConsole, fromSchedule })
 			: await runDailyMercariSpotlight(env, { commit, logToConsole, fromSchedule });
+	const fallbackSource = invertDailySpotlightSource(preferredSource);
+	if (commit && second.ok && Boolean((second as Record<string, unknown>).committed)) {
+		await stateStore.put(DAILY_LAST_SOURCE_KEY, fallbackSource);
+	}
 	const result = {
 		ok: Boolean(second.ok),
 		selectedSource: preferredSource,
@@ -467,12 +507,34 @@ async function runPriceSpikeMode(
 	try {
 		const payload = (await request.json()) as PriceSpikePayload;
 		const spikes = Array.isArray(payload?.spikes) ? payload.spikes : [];
-		const spike = spikes[0];
+		const rawSpike = spikes[0];
+		const spike = await enrichPriceSpikeIdentity(rawSpike, payload?.source);
 		if (!spike || !spike.card) {
 			return { ok: false, error: "invalid_payload", committed: false, postedToX: false, previewMessage: "" };
 		}
+		const inputValidation = validatePriceSpikeInput(spike, payload?.source);
+		if (!inputValidation.ok) {
+			return {
+				ok: false,
+				error: inputValidation.reason,
+				committed: false,
+				postedToX: false,
+				previewMessage: "",
+			};
+		}
 		const stateStore = createStateStore(env);
-		const key = `price_spike:${String(spike.card).trim()}`;
+		await stateStore.put(
+			LATEST_MARKET_CONTEXT_KEY,
+			JSON.stringify({
+				card: getCanonicalPriceSpikeCardName(spike),
+				cardId: String(spike.card_id ?? "").trim() || null,
+				sourceSite: normalizePriceSpikeSource(spike.source_site ?? payload?.source),
+				sourceUrl: spike.source_url ?? null,
+				fetchedAt: spike.fetched_at ?? new Date().toISOString(),
+				recordedAt: new Date().toISOString(),
+			}),
+		);
+		const key = `price_spike:${buildPriceSpikeIdentityKey(spike)}`;
 		const already = await stateStore.get(key);
 		if (already) {
 			return {
@@ -540,18 +602,22 @@ async function generatePriceSpikeMessage(
 	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
 	const model = env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 	const period = normalizePriceSpikePeriod(spike.period);
+	const canonicalCardName = getCanonicalPriceSpikeCardName(spike);
+	const sourceSite = normalizePriceSpikeSource(spike.source_site) || "snkrdunk/pokeca-chart";
 	const prompt = [
 		"以下の条件でX投稿文を1本作成してください。",
 		"",
-		`カード名: ${spike.card}`,
+		`カード名（厳密）: ${canonicalCardName}`,
+		`カード識別子: ${spike.card_id ?? "未指定"}`,
 		`前回価格: ${formatNumber(spike.before)}円`,
 		`現在価格: ${formatNumber(spike.after)}円`,
 		`変化率: +${Number(spike.change_pct).toFixed(2)}%`,
 		`比較期間: ${period}`,
 		`取得時刻: ${spike.fetched_at}`,
+		`参照サイト: ${sourceSite}`,
 		"",
 		"【出力ルール】",
-		"- 1行目: カード名 + 『{period}で+{変化率}%』の形式で、期間軸を明確に示す（例: リザードンex SAR、1週間で+33%。）",
+		"- 1行目: 上記のカード名（厳密）をそのまま使い、『{period}で+{変化率}%』の形式で書く",
 		"- 2行目: {前回価格}円 → {現在価格}円（+{変化率}%）",
 		"- 3行目: 背景の一文。『〜の影響かな』『〜が重なってるかも』のように推察をやわらかく書く",
 		"- URLは一切含めない（市場情報のみ）",
@@ -610,8 +676,9 @@ function validatePriceSpikeMessage(
 
 function buildPriceSpikeFallbackMessage(spike: PriceSpikeItem): string {
 	const period = normalizePriceSpikePeriod(spike.period);
+	const cardName = getCanonicalPriceSpikeCardName(spike);
 	const lines = [
-		`${spike.card}、${period}で+${Number(spike.change_pct).toFixed(2)}%。`,
+		`${cardName}、${period}で+${Number(spike.change_pct).toFixed(2)}%。`,
 		`${formatNumber(spike.before)}円 → ${formatNumber(spike.after)}円（+${Number(spike.change_pct).toFixed(2)}%）`,
 		"需給や注目度の重なりが出てきたのかも。",
 		"#ポケカ",
@@ -624,13 +691,183 @@ function normalizePriceSpikePeriod(period?: string): string {
 	return normalized || "直近";
 }
 
+function getCanonicalPriceSpikeCardName(spike: PriceSpikeItem): string {
+	const variant = String(spike.variant ?? "").trim();
+	const card = String(spike.card ?? "").trim();
+	return variant || card;
+}
+
+function buildPriceSpikeIdentityKey(spike: PriceSpikeItem): string {
+	const source = normalizePriceSpikeSource(spike.source_site) || "unknown";
+	const cardId = String(spike.card_id ?? "").trim();
+	const base = cardId || getCanonicalPriceSpikeCardName(spike);
+	return `${source}:${base}`.toLowerCase();
+}
+
+function normalizePriceSpikeSource(source: string | undefined): "snkrdunk" | "pokeca-chart" | null {
+	const lower = String(source ?? "").trim().toLowerCase();
+	if (!lower) return null;
+	if (lower.includes("snkrdunk")) return "snkrdunk";
+	if (lower.includes("pokeca-chart") || lower.includes("pokecachart")) return "pokeca-chart";
+	return null;
+}
+
+function hasCardVariantIdentifier(value: string): boolean {
+	const text = String(value ?? "");
+	return /[A-Za-z]{1,4}\d{1,4}|[0-9]{2,3}\/[0-9]{2,3}|sv\d+[a-z]?|s\d[a-z]\d/i.test(text);
+}
+
+function validatePriceSpikeInput(
+	spike: PriceSpikeItem,
+	payloadSource: string | undefined,
+): { ok: boolean; reason?: string } {
+	const canonicalName = getCanonicalPriceSpikeCardName(spike);
+	if (!canonicalName) return { ok: false, reason: "missing_card_name" };
+	if (!Number.isFinite(spike.before) || !Number.isFinite(spike.after) || spike.before <= 0 || spike.after <= 0) {
+		return { ok: false, reason: "invalid_price_values" };
+	}
+	const source = normalizePriceSpikeSource(spike.source_site ?? payloadSource);
+	if (!source) {
+		return { ok: false, reason: "unsupported_source_site" };
+	}
+	if (!isValidPriceSpikeSourceUrl(spike.source_url, source)) {
+		return { ok: false, reason: "invalid_or_missing_source_url" };
+	}
+	const cardId = String(spike.card_id ?? "").trim();
+	if (!cardId && !hasCardVariantIdentifier(canonicalName)) {
+		return { ok: false, reason: "ambiguous_card_variant" };
+	}
+	return { ok: true };
+}
+
+async function enrichPriceSpikeIdentity(
+	spike: PriceSpikeItem | undefined,
+	payloadSource: string | undefined,
+): Promise<PriceSpikeItem> {
+	const base = { ...(spike ?? ({} as PriceSpikeItem)) };
+	const source = normalizePriceSpikeSource(base.source_site ?? payloadSource);
+	if (!source) return base;
+	if (String(base.source_site ?? "").trim() === "") {
+		base.source_site = source;
+	}
+	if (!isValidPriceSpikeSourceUrl(base.source_url, source)) return base;
+	const hasStrongIdentity =
+		String(base.card_id ?? "").trim().length > 0 || hasCardVariantIdentifier(getCanonicalPriceSpikeCardName(base));
+	if (hasStrongIdentity) return base;
+
+	try {
+		const page = await fetchPriceSpikeSourcePage(base.source_url!);
+		const title = extractSourceTitle(page.html);
+		const titleWithId = title && hasCardVariantIdentifier(title) ? title : null;
+		if (titleWithId && titleWithId.includes(String(base.card ?? "").trim())) {
+			base.variant = titleWithId;
+		}
+		const idFromText =
+			extractCardIdentifierNearCardName(page.html, String(base.card ?? "").trim()) ||
+			(String(base.card ?? "").trim() && title?.includes(String(base.card ?? "").trim())
+				? extractCardIdentifierFromText(title ?? "")
+				: null);
+		if (!base.card_id && idFromText) {
+			base.card_id = idFromText;
+		}
+		if (!base.variant && idFromText) {
+			base.variant = `${String(base.card ?? "").trim()} ${idFromText}`.trim();
+		}
+	} catch {
+		// keep original input and let validation decide
+	}
+	return base;
+}
+
+async function fetchPriceSpikeSourcePage(
+	sourceUrl: string,
+): Promise<{ html: string; finalUrl: string; status: number }> {
+	const res = await fetch(sourceUrl, {
+		headers: { "user-agent": "Mozilla/5.0" },
+		redirect: "follow",
+	});
+	const html = await res.text();
+	return { html, finalUrl: res.url, status: res.status };
+}
+
+function extractSourceTitle(html: string): string | null {
+	const ogMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i);
+	if (ogMatch?.[1]) return decodeHtmlEntities(ogMatch[1]).replace(/\s+/g, " ").trim();
+	const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+	if (!titleMatch?.[1]) return null;
+	return decodeHtmlEntities(stripTags(titleMatch[1])).replace(/\s+/g, " ").trim();
+}
+
+function extractCardIdentifierFromText(text: string): string | null {
+	return extractCardIdentifierCandidatesFromText(text)[0] ?? null;
+}
+
+function extractCardIdentifierCandidatesFromText(text: string): string[] {
+	const candidates = new Set<string>();
+	const patterns = [
+		/\bsv\d+[a-z]?\s*[\-_/]?\s*\d{1,3}\/\d{1,3}\b/i,
+		/\b(?:sm|s|xy|bw|cp|dp|pcg)[a-z0-9\-]*\s*[\-_/]?\s*\d{1,3}\/\d{1,3}\b/i,
+		/\b\d{1,3}\/\d{1,3}\b/,
+	];
+	for (const pattern of patterns) {
+		const matches = text.matchAll(new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`));
+		for (const match of matches) {
+			if (!match?.[0]) continue;
+			candidates.add(match[0].replace(/\s+/g, "").toUpperCase());
+		}
+	}
+	return [...candidates];
+}
+
+function extractCardIdentifierNearCardName(html: string, cardName: string): string | null {
+	const target = String(cardName ?? "").trim();
+	if (!target) return null;
+	const plain = stripTags(html).replace(/\s+/g, " ");
+	const escaped = escapeRegExp(target);
+	const nameRegex = new RegExp(escaped, "ig");
+	const candidates = new Set<string>();
+	let match: RegExpExecArray | null;
+	while ((match = nameRegex.exec(plain)) !== null) {
+		const start = Math.max(0, match.index - 90);
+		const end = Math.min(plain.length, match.index + match[0].length + 90);
+		const windowText = plain.slice(start, end);
+		for (const id of extractCardIdentifierCandidatesFromText(windowText)) {
+			candidates.add(id);
+		}
+	}
+	if (candidates.size === 1) return [...candidates][0];
+	return null;
+}
+
+function isValidPriceSpikeSourceUrl(
+	sourceUrl: string | undefined,
+	source: "snkrdunk" | "pokeca-chart",
+): boolean {
+	if (!sourceUrl) return false;
+	let parsed: URL;
+	try {
+		parsed = new URL(sourceUrl);
+	} catch {
+		return false;
+	}
+	const host = parsed.hostname.toLowerCase();
+	if (source === "snkrdunk") {
+		return host === "snkrdunk.com" || host.endsWith(".snkrdunk.com");
+	}
+	return host === "pokeca-chart.com" || host.endsWith(".pokeca-chart.com");
+}
+
 function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function pickDailySpotlightSource(dateSeed: number): "tcgstore" | "mercari" {
-	const mixed = ((dateSeed * 2654435761) >>> 0) % 2;
+function pickDailySpotlightSource(seed: number): "tcgstore" | "mercari" {
+	const mixed = ((seed * 2654435761) >>> 0) % 2;
 	return mixed === 0 ? "tcgstore" : "mercari";
+}
+
+function invertDailySpotlightSource(source: "tcgstore" | "mercari"): "tcgstore" | "mercari" {
+	return source === "tcgstore" ? "mercari" : "tcgstore";
 }
 
 async function runDailyMercariSpotlight(
@@ -639,6 +876,7 @@ async function runDailyMercariSpotlight(
 ): Promise<Record<string, unknown>> {
 	const { commit = false, logToConsole = true, fromSchedule = false, pickOffset = 0 } = options;
 	const stateStore = createStateStore(env);
+	const marketContext = await getLatestMarketContext(stateStore);
 	const dateSeed = getJstDateSeed();
 	const baseItems = (await fetchAllCandidateItems()).filter((item) => item.source === "mercari");
 	const candidates: Array<{
@@ -659,31 +897,43 @@ async function runDailyMercariSpotlight(
 		if (logToConsole) console.log(JSON.stringify({ type: "MERCARI_DAILY_SKIP", ...result }, null, 2));
 		return result;
 	}
-	const mercariHistoryRaw = await stateStore.get(MERCARI_HISTORY_KEY);
-	const mercariRecentUrls: string[] = mercariHistoryRaw ? JSON.parse(mercariHistoryRaw) : [];
-	const legacyMercariUrl = await stateStore.get(MERCARI_LAST_URL_KEY);
-	if (legacyMercariUrl && !mercariRecentUrls.includes(legacyMercariUrl)) mercariRecentUrls.push(legacyMercariUrl);
-
-	let selectedIndex = dateSeed % candidates.length;
-	if (candidates.length > 1) {
-		for (let i = 0; i < candidates.length; i++) {
-			const idx = (selectedIndex + i) % candidates.length;
-			if (!mercariRecentUrls.includes(candidates[idx].item.url)) {
-				selectedIndex = idx;
-				break;
-			}
-		}
-	}
-	if (pickOffset !== 0) {
-		selectedIndex = (selectedIndex + pickOffset + candidates.length) % candidates.length;
-	}
-	const selected = candidates[selectedIndex];
-	const message = buildDailyMercariMessage({
+	const prioritizedCandidates = prioritizeMercariCandidatesByMarketContext(candidates, marketContext);
+	const selectionCandidates = prioritizedCandidates.length > 0 ? prioritizedCandidates : candidates;
+	const lastUrl = await stateStore.get(MERCARI_LAST_URL_KEY);
+	const recentUrls = await getRecentUrlHistory(stateStore, MERCARI_RECENT_URLS_KEY);
+	const slotSeed = getJstSlotSeed();
+	const selectedIndex = pickIndexWithHistoryGuard({
+		size: selectionCandidates.length,
+		seed: dateSeed + slotSeed,
+		pickOffset,
+		urlAt: (index) => selectionCandidates[index]?.item.url ?? "",
+		lastUrl,
+		recentUrls,
+	});
+	const selected = selectionCandidates[selectedIndex];
+	const messageResult = await generateDailyMercariAiMessage({
 		title: selected.title.title,
 		url: selected.item.url,
 		remaining: selected.detail.detailRemaining,
 		totalCount: selected.detail.totalCount,
+		env,
+		marketContext,
 	});
+	if (!messageResult.ok || !messageResult.message) {
+		const result = {
+			ok: false,
+			reason: "mercari_ai_failed",
+			fromSchedule,
+			commitMode: commit,
+			source: "mercari",
+			selected: { title: selected.title.title, url: selected.item.url },
+			aiReason: messageResult.reason ?? "ai_generation_failed",
+			marketContext,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "MERCARI_DAILY_SKIP_AI", ...result }, null, 2));
+		return result;
+	}
+	const message = messageResult.message;
 	let postedToX = false;
 	let committed = false;
 	let xResponse: unknown = null;
@@ -697,8 +947,7 @@ async function runDailyMercariSpotlight(
 		xResponse = postResult;
 		if (postResult.ok) {
 			await stateStore.put(MERCARI_LAST_URL_KEY, selected.item.url);
-			const newMercariHistory = [selected.item.url, ...mercariRecentUrls].slice(0, HISTORY_SIZE);
-			await stateStore.put(MERCARI_HISTORY_KEY, JSON.stringify(newMercariHistory));
+			await appendRecentUrlHistory(stateStore, MERCARI_RECENT_URLS_KEY, selected.item.url);
 			committed = true;
 		}
 	}
@@ -708,7 +957,8 @@ async function runDailyMercariSpotlight(
 		fromSchedule,
 		commitMode: commit,
 		selectedIndex,
-		candidateCount: candidates.length,
+		candidateCount: selectionCandidates.length,
+		baseCandidateCount: candidates.length,
 		selected: {
 			title: selected.title.title,
 			titleSource: selected.title.source,
@@ -718,8 +968,13 @@ async function runDailyMercariSpotlight(
 			percent: selected.detail.percent,
 			mainImageUrl: selected.detail.mainImageUrl,
 		},
-		lastPostedUrl: mercariRecentUrls[0] ?? null,
+		lastPostedUrl: lastUrl,
+		recentPostedUrls: recentUrls,
+		marketContext,
 		previewMessage: message,
+		aiUsed: true,
+		aiModel: messageResult.model,
+		aiReason: null,
 		postedToX,
 		committed,
 		xResponse,
@@ -728,46 +983,60 @@ async function runDailyMercariSpotlight(
 	return result;
 }
 
-function buildDailyMercariMessage({
+async function generateDailyMercariAiMessage({
 	title,
 	url,
 	remaining,
 	totalCount,
+	env,
+	marketContext,
 }: {
 	title: string;
 	url: string;
 	remaining: number | null;
 	totalCount: number | null;
-}): string {
+	env: MonitorEnv;
+	marketContext: { card: string; fetchedAt: string } | null;
+}): Promise<{ ok: boolean; message?: string; reason?: string; model: string | null }> {
+	if (!env.ANTHROPIC_API_KEY) {
+		return { ok: false, reason: "missing_anthropic_api_key", model: env.ANTHROPIC_MODEL ?? null };
+	}
+	const model = env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 	const rem =
 		Number.isFinite(remaining) && Number.isFinite(totalCount) && totalCount && totalCount > 0
 			? `残り${formatNumber(remaining as number)}回（全${formatNumber(totalCount)}回）`
 			: "販売中のくじをピックアップ";
-	const seed = hashSeed(`${title}|${url}|${rem}`);
-	const titleEmojis = ["👀", "😏", "😮‍💨", "🫠", ""];
-	const lineEndEmojis = ["😏", "👀", "😮‍💨", "🫠", ""];
-	const oneLiners = [
-		"名前だけで反応する人、いるやつ。",
-		"この並び、やっぱり強い。",
-		"こういうの、見た瞬間に止まる。",
-		"見覚えある人ほど気になるやつ。",
-		"懐かしいのに、ちゃんと強い。",
-		"王道の空気、静かに残ってる。",
-		"刺さる人には一瞬で刺さるやつ。",
-		"わかる人には、説明いらない。",
-	];
-	const titleEmoji = titleEmojis[seed % titleEmojis.length];
-	const lineEmoji = lineEndEmojis[(seed >>> 1) % lineEndEmojis.length];
-	const oneLiner = oneLiners[(seed >>> 2) % oneLiners.length];
-	return [
-		"🎉本日のメルカリくじ紹介🎉",
-		`🎯 ${title}${titleEmoji ? ` ${titleEmoji}` : ""}`,
+	const prompt = [
+		"メルカリくじの紹介投稿を1本作成してください。",
+		`商品名: ${title}`,
+		`在庫情報: ${rem}`,
+		`商品URL: ${url}`,
+		`直近の市場注目カード: ${marketContext?.card ?? "なし"}`,
+		`市場注目取得時刻: ${marketContext?.fetchedAt ?? "なし"}`,
 		"",
-		rem,
-		`${oneLiner}${lineEmoji}`,
-		"",
-		url,
+		"【出力ルール】",
+		"- 本文は2〜4行、最後の行はURLのみ",
+		"- 1行目は商品名から始めない。読み手メリットや事実から始める",
+		"- 絵文字は0〜1個まで。ハッシュタグは禁止",
+		"- 売り込み口調を避け、事実ベースで簡潔に書く",
+		"- 在庫が多い場合に煽らない",
+		"- 市場注目カードが商品名に含まれる場合だけ、関連を1フレーズで触れてよい",
 	].join("\n");
+	const response = await callAnthropicTextGeneration({
+		system: MERCARI_DAILY_AI_SYSTEM_PROMPT,
+		prompt,
+		apiKey: env.ANTHROPIC_API_KEY,
+		model,
+	});
+	if (!response.ok || !response.text) {
+		return { ok: false, reason: response.reason ?? "anthropic_request_failed", model };
+	}
+	const normalized = normalizeDailyAiMessage(response.text, url);
+	const validation = validateMercariDailyAiMessage(normalized, url);
+	if (!validation.ok) {
+		return { ok: false, reason: validation.reasons.join(" / "), model };
+	}
+	return { ok: true, message: normalized, model };
 }
 
 async function runDailyTcgStoreSamples(
@@ -910,17 +1179,8 @@ async function buildDailyTcgStorePostMessage({
 			reason: null,
 		};
 	}
-
-	const phrase = DAILY_PHRASES[dateSeed % DAILY_PHRASES.length];
-	const fallbackMessage = buildDailyTcgStoreFallbackMessage({
-		title: selected.name,
-		price: selected.price,
-		priceUnit: selected.priceUnit,
-		phrase,
-		url: selected.url,
-	});
 	return {
-		message: applyHashtagPolicy(fallbackMessage, selected.url, requiredTags),
+		message: "",
 		aiUsed: false,
 		pattern: patternPlan.pattern,
 		model: aiResult.model,
@@ -1120,12 +1380,12 @@ function buildDailyTcgStoreAiUserPrompt({
 		"",
 		"【出力ルール】",
 		"- ★最重要★ 投稿の冒頭（1行目）は商品名ではなく、読み手にとっての具体的メリット・数値的事実から始めること",
-		"  例: 「1等確率0.1%のリザードンSAR入り」「最低保証1,100coin・赤字なしで引ける」「1口999coinで〇〇狙い」",
+		"  例: 「最低保証1,100coin・赤字なしで引ける」「1口999coinで〇〇狙い」「1日1回限定で試せる」",
 		"  NG: 「⚡黒炎の舞」のような商品名だけの冒頭",
 		...(lengthMode === "short"
 			? [
 					"- ★文字数モード: short★ URL込みで60〜90文字。1〜2文で要点だけサラッと書く。余計な説明は不要。",
-					"  事実1つ＋一言だけでOK。例: 「1等確率0.1%、999coinで引けるリザードン入りオリパ。\\n{URL}」",
+					"  事実1つ＋一言だけでOK。例: 「1人1回限定、最低保証1,100coin。\\n{URL}」",
 				]
 			: [
 					"- ★文字数モード: full★ URL込みで100〜140文字。しっかり情報を盛り込む。",
@@ -1142,23 +1402,15 @@ function buildDailyTcgStoreAiUserPrompt({
 		"- 一人称の感想表現（正直、個人的には、〜と思う、〜気がする）は禁止",
 		"- 「絶対」「確実」「買うべき」などの断定表現は禁止",
 		"- 相場情報、当たり内容、完売速度、カード詳細など未提供情報は書かない",
-		"- 上位賞の確率データが提供されている場合、具体的な確率を積極的に引用する（読み手の判断材料になる）",
-		...(top2Odds
-			? [
-					`- 1等+2等の言い回しは「1等と2等は約${top2Odds.peoplePerOne}人に1人」を優先する（この商品の事実値: ${top2Odds.percentage.toFixed(2)}%）`,
-				]
-			: []),
+		"- 上位賞の確率データは内部判断用。本文で「N人に1人」「0.x%」の確率訴求は使わない",
 		"- 『1等+2等合計確率』を、全体の保証表現（必ず/全員/100%）に置き換えてはいけない",
 		"- ランク名からカテゴリ解釈を作らない（例: Legendary以上 / Legendaryクラス / 上位グレード などは禁止）",
 		"- カード名の英単語は原文を勝手に補正しない（例: API原文が Legndary なら Legendary に直さない）",
 		"- 『リターンより体験を楽しむ』『目安になる』など、購買意欲を削ぐ曖昧・消極表現は禁止",
-		...(top2Probability != null && top2Probability < 1
-			? [
-					`- 1等+2等合計確率は${top2Probability.toFixed(2)}%（低確率）。魅力として煽らず、低確率である事実を中立に伝える。`,
-					"- 「当たりやすい」「狙いやすい」「期待感が上がる」などの誘導表現は禁止。",
-				]
+		...(top2Probability != null
+			? ["- 「当たりやすい」「狙いやすい」「期待感が上がる」などの誘導表現は禁止。"]
 			: []),
-		`- テンションモードがhypeの時は絵文字1〜3個でメリハリ強め、calmの時は0〜1個で落ち着かせる`,
+		`- 絵文字は0〜1個まで。装飾目的の連打はしない`,
 	];
 
 	const patternSection = (() => {
@@ -1285,6 +1537,26 @@ function normalizeDailyAiMessage(text: string, url: string): string {
 	return `${withoutUrls}\n${url}`.trim();
 }
 
+function validateMercariDailyAiMessage(text: string, url: string): { ok: boolean; reasons: string[] } {
+	const reasons: string[] = [];
+	const length = countXLength(text);
+	if (length < 70) reasons.push(`文字数不足(${length})`);
+	if (length > 150) reasons.push(`文字数超過(${length})`);
+	if (!text.endsWith(url)) reasons.push("URLは末尾に配置してください");
+	if (/#[\p{L}\p{N}_]+/u.test(text)) reasons.push("ハッシュタグは禁止です");
+	const body = text.replace(url, "").trim();
+	if (countEmoji(body) > 1) reasons.push("絵文字は0〜1個までにしてください");
+	const firstLine = body.split(/\n/).find(Boolean) ?? "";
+	if (!firstLine) reasons.push("本文が不足しています");
+	if (/^(本日|今日).{0,8}(メルカリ|くじ)/.test(firstLine) || /^🎉|^🎯/.test(firstLine)) {
+		reasons.push("テンプレ導入文を禁止しています");
+	}
+	if (/残り少|急げ|今すぐ|ラストチャンス/.test(body)) {
+		reasons.push("煽り表現を検出しました");
+	}
+	return { ok: reasons.length === 0, reasons };
+}
+
 function validateDailyAiMessage(
 	text: string,
 	url: string,
@@ -1298,7 +1570,6 @@ function validateDailyAiMessage(
 	const reasons: string[] = [];
 	const length = countXLength(text);
 	const emojiCount = countEmoji(text.replace(url, "").trim());
-	const startsWithEmoji = /^[\p{Extended_Pictographic}]/u.test(text.trim());
 	const bodyText = text.replace(url, "").trim();
 	const body = bodyText.toLowerCase();
 
@@ -1309,9 +1580,8 @@ function validateDailyAiMessage(
 	if (!text.endsWith(url)) reasons.push("URLが末尾にありません");
 	if ((text.match(/#/g) || []).length > 2) reasons.push("ハッシュタグが多すぎます");
 	if (!text.includes(url)) reasons.push("URLが含まれていません");
-	const maxEmoji = toneMode === "hype" ? 3 : 1;
+	const maxEmoji = 1;
 	if (emojiCount > maxEmoji) reasons.push("絵文字が多すぎます");
-	if (emojiCount > 0 && !startsWithEmoji) reasons.push("絵文字は先頭に置いてください");
 	if (selected.priceUnit !== "pOAS") {
 		if (body.includes("poas") || body.includes("oas")) {
 			reasons.push("非pOAS商品でpOAS/OASに言及しています");
@@ -1367,6 +1637,12 @@ function validateDailyAiMessage(
 	if (/リターンより|体験を楽し|選ぶときの目安|目安になる/.test(text)) {
 		reasons.push("消極的で訴求が弱い文言を検出しました");
 	}
+	if (/[0-9]+人に1人/.test(text)) {
+		reasons.push("『N人に1人』表現は禁止です");
+	}
+	if (/(^|[^0-9])0\.[0-9]+[%％]/.test(text)) {
+		reasons.push("『0.x%』表現は禁止です");
+	}
 	const sourcePrizeText = `${detailFacts.topPrizeNames.join(" ")} ${detailFacts.secondPrizeNames.join(" ")}`.toLowerCase();
 	if (body.includes("legendary") && !sourcePrizeText.includes("legendary")) {
 		reasons.push("カード名の英単語を原文から補正した表現を検出しました");
@@ -1383,33 +1659,19 @@ function validateDailyAiMessage(
 		reasons.push("保証根拠がない断定表現（必ず/確定/100%）を検出しました");
 	}
 	const top2Probability = calcTop2ProbabilityPercent(detailFacts, selected.supply);
-	if (top2Probability != null && top2Probability < 1) {
+	if (top2Probability != null) {
 		if (
 			/当たりやす|狙いやす|期待感が(上が|変わ)|魅力|熱い|チャンス|高確率|引き得|アツい/.test(
 				text,
 			)
 		) {
-			reasons.push("上位賞低確率（1%未満）なのに煽り表現を検出しました");
+			reasons.push("確率を根拠にした煽り表現を検出しました");
 		}
 	}
 	if (
 		!/1等|2等|人に1人|最低|保証|1日1回|低額|coinで引ける|挑戦できる|狙い/u.test(text)
 	) {
 		reasons.push("読み手メリットの具体表現が不足しています");
-	}
-	const top2Odds = calcTop2Odds(detailFacts, selected.supply);
-	if (
-		top2Odds &&
-		top2Odds.percentage >= 1 &&
-		top2Odds.percentage <= 20 &&
-		(/1等|2等/.test(text) || /上位/.test(text)) &&
-		!new RegExp(`1等.*2等.*${top2Odds.peoplePerOne}人に1人|${top2Odds.peoplePerOne}人に1人.*1等.*2等`).test(
-			text,
-		)
-	) {
-		reasons.push(
-			`1等+2等の確率は「${top2Odds.peoplePerOne}人に1人」の言い回しを優先してください`,
-		);
 	}
 	const firstLine = text.trim().split(/\n/)[0].replace(/[\p{Extended_Pictographic}\s]/gu, "");
 	const cleanName = selected.name.replace(/[\s_\-]/g, "");
@@ -2510,6 +2772,135 @@ function getJstDateSeed(now = new Date()): number {
 	return Number(`${y}${m}${d}`);
 }
 
+function getJstSlotSeed(now = new Date()): number {
+	const jst = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+	const y = jst.getFullYear();
+	const m = String(jst.getMonth() + 1).padStart(2, "0");
+	const d = String(jst.getDate()).padStart(2, "0");
+	const slot = jst.getHours() < 18 ? 0 : 1;
+	return Number(`${y}${m}${d}${slot}`);
+}
+
+function pickIndexWithHistoryGuard({
+	size,
+	seed,
+	pickOffset,
+	urlAt,
+	lastUrl,
+	recentUrls,
+}: {
+	size: number;
+	seed: number;
+	pickOffset: number;
+	urlAt: (index: number) => string;
+	lastUrl: string | null;
+	recentUrls: string[];
+}): number {
+	let index = ((seed % size) + size) % size;
+	if (pickOffset !== 0) {
+		index = (index + pickOffset + size) % size;
+	}
+	if (size <= 1) return index;
+
+	const blocked = new Set(
+		[lastUrl, ...recentUrls].map((url) => String(url ?? "").trim()).filter((url) => url.length > 0),
+	);
+	if (blocked.size === 0) return index;
+	if (!blocked.has(urlAt(index))) return index;
+
+	for (let i = 1; i < size; i++) {
+		const probe = (index + i) % size;
+		const url = urlAt(probe);
+		if (!blocked.has(url)) return probe;
+	}
+	return index;
+}
+
+async function getRecentUrlHistory(stateStore: StateStore, key: string): Promise<string[]> {
+	const raw = await stateStore.get(key);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed
+			.map((value) => String(value ?? "").trim())
+			.filter((url) => url.length > 0)
+			.slice(0, DAILY_RECENT_HISTORY_LIMIT);
+	} catch {
+		return [];
+	}
+}
+
+async function appendRecentUrlHistory(stateStore: StateStore, key: string, url: string): Promise<void> {
+	const normalized = String(url ?? "").trim();
+	if (!normalized) return;
+	const current = await getRecentUrlHistory(stateStore, key);
+	const next = [normalized, ...current.filter((item) => item !== normalized)].slice(0, DAILY_RECENT_HISTORY_LIMIT);
+	await stateStore.put(key, JSON.stringify(next));
+}
+
+async function getLatestMarketContext(
+	stateStore: StateStore,
+): Promise<{ card: string; fetchedAt: string } | null> {
+	const raw = await stateStore.get(LATEST_MARKET_CONTEXT_KEY);
+	if (!raw) return null;
+	try {
+		const parsed = JSON.parse(raw) as { card?: string; fetchedAt?: string; recordedAt?: string };
+		const card = String(parsed.card ?? "").trim();
+		const fetchedAt = String(parsed.fetchedAt ?? parsed.recordedAt ?? "").trim();
+		if (!card || !fetchedAt) return null;
+		const ageMs = Date.now() - new Date(fetchedAt).getTime();
+		if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > 1000 * 60 * 60 * 72) return null;
+		return { card, fetchedAt };
+	} catch {
+		return null;
+	}
+}
+
+function prioritizeCandidatesByMarketContext(
+	candidates: TcgStoreOripaCandidate[],
+	marketContext: { card: string; fetchedAt: string } | null,
+): TcgStoreOripaCandidate[] {
+	if (!marketContext) return [];
+	const keyword = normalizeMatchText(extractTrendKeyword(marketContext.card));
+	if (!keyword) return [];
+	return candidates.filter((item) => normalizeMatchText(item.name).includes(keyword));
+}
+
+function prioritizeMercariCandidatesByMarketContext(
+	candidates: Array<{ item: CandidateItem; detail: ItemDetail; title: PickedTitle }>,
+	marketContext: { card: string; fetchedAt: string } | null,
+): Array<{ item: CandidateItem; detail: ItemDetail; title: PickedTitle }> {
+	if (!marketContext) return [];
+	const keyword = normalizeMatchText(extractTrendKeyword(marketContext.card));
+	if (!keyword) return [];
+	return candidates.filter((entry) => {
+		const t1 = normalizeMatchText(entry.title.title);
+		const t2 = normalizeMatchText(entry.detail.detailTextHint);
+		return t1.includes(keyword) || t2.includes(keyword);
+	});
+}
+
+function extractTrendKeyword(cardName: string): string {
+	return String(cardName ?? "")
+		.replace(/\b(?:sar|sr|ur|hr|ar|rrr|rr|r)\b/gi, " ")
+		.replace(/\b(?:sv|sm|xy|bw|s)[a-z0-9\-_/]*\b/gi, " ")
+		.replace(/\b\d{1,3}\/\d{1,3}\b/g, " ")
+		.replace(/[()[\]{}]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.split(" ")
+		.filter(Boolean)
+		.sort((a, b) => b.length - a.length)[0] ?? "";
+}
+
+function normalizeMatchText(value: string | null | undefined): string {
+	return String(value ?? "")
+		.toLowerCase()
+		.replace(/[ぁ-ん]/g, (s) => String.fromCharCode(s.charCodeAt(0) + 0x60))
+		.replace(/\s+/g, "");
+}
+
 async function buildOAuth1Header({
 	method,
 	url,
@@ -2662,8 +3053,11 @@ async function fetchMercariItemDetail(url: string): Promise<ItemDetail> {
 		text.includes("ラスイチ") || text.includes("ラストワン") || text.includes("最後の1枚");
 
 	const imageUrls = extractImageUrls(html, "https://nft.jp.mercari.com");
+	const ogImageUrl = extractOgImageUrl(html, "https://nft.jp.mercari.com");
 	const mainImageUrl =
-		extractOgImageUrl(html, "https://nft.jp.mercari.com") || imageUrls[0] || null;
+		extractMercariKeyVisualUrl(html) ||
+		pickPreferredMercariImageUrl(imageUrls) ||
+		(isLikelyMercariKeyVisual(ogImageUrl) ? ogImageUrl : null);
 	const extractedTitle = extractKujiTitleFromHtml(html);
 
 	let lastOneImageUrl: string | null = null;
@@ -2915,6 +3309,12 @@ function extractImageUrls(html: string, baseOrigin: string): string[] {
 		if (normalized) urls.add(normalized);
 	}
 
+	const absoluteImageUrlRegex = /(https?:\/\/[^\s"'<>]+?\.(?:png|jpe?g|webp)(?:\?[^\s"'<>]*)?)/gi;
+	while ((match = absoluteImageUrlRegex.exec(html)) !== null) {
+		const normalized = normalizeUrl(match[1], baseOrigin);
+		if (normalized) urls.add(normalized);
+	}
+
 	return [...urls];
 }
 
@@ -2922,6 +3322,57 @@ function extractOgImageUrl(html: string, baseOrigin: string): string | null {
 	const match = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
 	if (!match?.[1]) return null;
 	return normalizeUrl(match[1], baseOrigin);
+}
+
+function extractMercariKeyVisualUrl(html: string): string | null {
+	const patterns = [
+		/"keyVisual(?:Url)?"\s*:\s*"([^"]+)"/i,
+		/"mainImage(?:Url)?"\s*:\s*"([^"]+)"/i,
+		/"heroImage(?:Url)?"\s*:\s*"([^"]+)"/i,
+		/"thumbnailImage(?:Url)?"\s*:\s*"([^"]+)"/i,
+	];
+	for (const pattern of patterns) {
+		const match = html.match(pattern);
+		if (!match?.[1]) continue;
+		const normalized = normalizeUrl(decodeEscapedUrl(match[1]), "https://nft.jp.mercari.com");
+		if (isLikelyMercariKeyVisual(normalized)) return normalized;
+	}
+	return null;
+}
+
+function pickPreferredMercariImageUrl(imageUrls: string[]): string | null {
+	const scored = imageUrls
+		.map((imageUrl) => ({ imageUrl, score: scoreMercariImageUrl(imageUrl) }))
+		.filter((row) => row.score > -100)
+		.sort((a, b) => b.score - a.score);
+	return scored[0]?.imageUrl ?? null;
+}
+
+function isLikelyMercariKeyVisual(url: string | null): boolean {
+	if (!url) return false;
+	const lower = url.toLowerCase();
+	if (!lower.startsWith("http")) return false;
+	if (
+		/opengraph\.png|\/opengraph(?:[_-][a-z0-9]+)?\.png|favicon|apple-touch-icon|logo|icon/i.test(lower)
+	) {
+		return false;
+	}
+	return true;
+}
+
+function decodeEscapedUrl(value: string): string {
+	return String(value ?? "")
+		.replace(/\\\//g, "/")
+		.replace(/\\"/g, '"');
+}
+
+function scoreMercariImageUrl(url: string): number {
+	const lower = String(url ?? "").toLowerCase();
+	if (!isLikelyMercariKeyVisual(url)) return -100;
+	if (/\/random_sales\//.test(lower)) return 100;
+	if (/campaign\.jp\.mercari\.com\/pages\/images\//.test(lower)) return 90;
+	if (/mercdn\.net/.test(lower)) return 80;
+	return 50;
 }
 
 function normalizeUrl(url: string, baseOrigin = "https://nft.jp.mercari.com"): string | null {
