@@ -113,7 +113,10 @@ type StateStore = {
 
 const localStateFallback = new Map<string, string>();
 const TCGSTORE_LAST_URL_KEY = "last_oripa_url";
+const TCGSTORE_HISTORY_KEY = "oripa_url_history";
 const MERCARI_LAST_URL_KEY = "last_mercari_url";
+const MERCARI_HISTORY_KEY = "mercari_url_history";
+const HISTORY_SIZE = 5;
 const DAILY_AI_PATTERN_ORDER: DailyAiPattern[] = [
 	"market_analysis",
 	"contrarian",
@@ -295,12 +298,24 @@ async function runDailyTcgStoreSpotlight(
 		return result;
 	}
 
-	const lastUrl = await stateStore.get(TCGSTORE_LAST_URL_KEY);
+	const historyRaw = await stateStore.get(TCGSTORE_HISTORY_KEY);
+	const recentUrls: string[] = historyRaw ? JSON.parse(historyRaw) : [];
+	// 後方互換: 旧キーの値もhistoryに含める
+	const legacyUrl = await stateStore.get(TCGSTORE_LAST_URL_KEY);
+	if (legacyUrl && !recentUrls.includes(legacyUrl)) recentUrls.push(legacyUrl);
+
 	const dateSeed = getJstDateSeed();
 
 	let selectedIndex = dateSeed % validCandidates.length;
-	if (validCandidates.length > 1 && validCandidates[selectedIndex].url === lastUrl) {
-		selectedIndex = (selectedIndex + 1) % validCandidates.length;
+	// 直近HISTORY_SIZE件に含まれる場合は次の候補へ（全周して見つからなければそのまま）
+	if (validCandidates.length > 1) {
+		for (let i = 0; i < validCandidates.length; i++) {
+			const idx = (selectedIndex + i) % validCandidates.length;
+			if (!recentUrls.includes(validCandidates[idx].url)) {
+				selectedIndex = idx;
+				break;
+			}
+		}
 	}
 	if (pickOffset !== 0) {
 		selectedIndex = (selectedIndex + pickOffset + validCandidates.length) % validCandidates.length;
@@ -345,6 +360,8 @@ async function runDailyTcgStoreSpotlight(
 		xResponse = postResult;
 		if (postResult.ok) {
 			await stateStore.put(TCGSTORE_LAST_URL_KEY, selected.url);
+			const newHistory = [selected.url, ...recentUrls].slice(0, HISTORY_SIZE);
+			await stateStore.put(TCGSTORE_HISTORY_KEY, JSON.stringify(newHistory));
 			committed = true;
 		}
 	}
@@ -375,7 +392,7 @@ async function runDailyTcgStoreSpotlight(
 			maxCoinPrize: selectedDetail.maxCoinPrize,
 			rankProbabilities: selectedDetail.rankProbabilities,
 		},
-		lastPostedUrl: lastUrl,
+		lastPostedUrl: recentUrls[0] ?? null,
 		previewMessage: message,
 		aiUsed: messageResult.aiUsed,
 		aiPattern: messageResult.pattern,
@@ -642,10 +659,20 @@ async function runDailyMercariSpotlight(
 		if (logToConsole) console.log(JSON.stringify({ type: "MERCARI_DAILY_SKIP", ...result }, null, 2));
 		return result;
 	}
-	const lastUrl = await stateStore.get(MERCARI_LAST_URL_KEY);
+	const mercariHistoryRaw = await stateStore.get(MERCARI_HISTORY_KEY);
+	const mercariRecentUrls: string[] = mercariHistoryRaw ? JSON.parse(mercariHistoryRaw) : [];
+	const legacyMercariUrl = await stateStore.get(MERCARI_LAST_URL_KEY);
+	if (legacyMercariUrl && !mercariRecentUrls.includes(legacyMercariUrl)) mercariRecentUrls.push(legacyMercariUrl);
+
 	let selectedIndex = dateSeed % candidates.length;
-	if (candidates.length > 1 && candidates[selectedIndex].item.url === lastUrl) {
-		selectedIndex = (selectedIndex + 1) % candidates.length;
+	if (candidates.length > 1) {
+		for (let i = 0; i < candidates.length; i++) {
+			const idx = (selectedIndex + i) % candidates.length;
+			if (!mercariRecentUrls.includes(candidates[idx].item.url)) {
+				selectedIndex = idx;
+				break;
+			}
+		}
 	}
 	if (pickOffset !== 0) {
 		selectedIndex = (selectedIndex + pickOffset + candidates.length) % candidates.length;
@@ -670,6 +697,8 @@ async function runDailyMercariSpotlight(
 		xResponse = postResult;
 		if (postResult.ok) {
 			await stateStore.put(MERCARI_LAST_URL_KEY, selected.item.url);
+			const newMercariHistory = [selected.item.url, ...mercariRecentUrls].slice(0, HISTORY_SIZE);
+			await stateStore.put(MERCARI_HISTORY_KEY, JSON.stringify(newMercariHistory));
 			committed = true;
 		}
 	}
@@ -689,7 +718,7 @@ async function runDailyMercariSpotlight(
 			percent: selected.detail.percent,
 			mainImageUrl: selected.detail.mainImageUrl,
 		},
-		lastPostedUrl: lastUrl,
+		lastPostedUrl: mercariRecentUrls[0] ?? null,
 		previewMessage: message,
 		postedToX,
 		committed,
