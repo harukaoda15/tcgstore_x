@@ -29,6 +29,14 @@ type DailyTcgPreviewOptions = {
 	logToConsole?: boolean;
 };
 
+type LatestMarketContext = {
+	card: string;
+	fetchedAt: string;
+	beforePrice: number;
+	afterPrice: number;
+	changePct: number;
+};
+
 type PriceSpikeItem = {
 	card: string;
 	variant?: string;
@@ -123,6 +131,7 @@ const MERCARI_RECENT_URLS_KEY = "recent_mercari_urls";
 const DAILY_LAST_SOURCE_KEY = "last_daily_source";
 const LATEST_MARKET_CONTEXT_KEY = "latest_market_context";
 const DAILY_RECENT_HISTORY_LIMIT = 10;
+const ALERT_MARKET_CHANGE_PCT_MIN = 8;
 const DAILY_AI_PATTERN_ORDER: DailyAiPattern[] = [
 	"market_analysis",
 	"contrarian",
@@ -287,7 +296,6 @@ async function runDailyTcgStoreSpotlight(
 	} = options;
 	const stateStore = createStateStore(env);
 	const excludeSet = new Set(excludeUnits.map((u) => u.toLowerCase()));
-	const marketContext = await getLatestMarketContext(stateStore);
 	const marketContext = await getLatestMarketContext(stateStore);
 
 	const candidates = await fetchTcgStoreOripaCandidates();
@@ -528,6 +536,9 @@ async function runPriceSpikeMode(
 			JSON.stringify({
 				card: getCanonicalPriceSpikeCardName(spike),
 				cardId: String(spike.card_id ?? "").trim() || null,
+				beforePrice: Number(spike.before),
+				afterPrice: Number(spike.after),
+				changePct: Number(spike.change_pct),
 				sourceSite: normalizePriceSpikeSource(spike.source_site ?? payload?.source),
 				sourceUrl: spike.source_url ?? null,
 				fetchedAt: spike.fetched_at ?? new Date().toISOString(),
@@ -996,7 +1007,7 @@ async function generateDailyMercariAiMessage({
 	remaining: number | null;
 	totalCount: number | null;
 	env: MonitorEnv;
-	marketContext: { card: string; fetchedAt: string } | null;
+	marketContext: LatestMarketContext | null;
 }): Promise<{ ok: boolean; message?: string; reason?: string; model: string | null }> {
 	if (!env.ANTHROPIC_API_KEY) {
 		return { ok: false, reason: "missing_anthropic_api_key", model: env.ANTHROPIC_MODEL ?? null };
@@ -1019,7 +1030,9 @@ async function generateDailyMercariAiMessage({
 		"- 1行目は商品名から始めない。読み手メリットや事実から始める",
 		"- 絵文字は0〜1個まで。ハッシュタグは禁止",
 		"- 売り込み口調を避け、事実ベースで簡潔に書く",
-		"- 在庫が多い場合に煽らない",
+		"- 在庫表現は「まだ引ける」「まだ回せる」を優先し、「残っている」を避ける",
+		"- 「じっくり選んで引ける」「内容を確認してみてください」など仕様とズレる誘導文を禁止",
+		"- 「実質的なロス」「繰り返し引く選択肢」など不自然な説明文を禁止",
 		"- 市場注目カードが商品名に含まれる場合だけ、関連を1フレーズで触れてよい",
 	].join("\n");
 	const response = await callAnthropicTextGeneration({
@@ -1551,6 +1564,15 @@ function validateMercariDailyAiMessage(text: string, url: string): { ok: boolean
 	if (/^(本日|今日).{0,8}(メルカリ|くじ)/.test(firstLine) || /^🎉|^🎯/.test(firstLine)) {
 		reasons.push("テンプレ導入文を禁止しています");
 	}
+	if (/残っている|残ってる/.test(body)) {
+		reasons.push("在庫のネガティブ表現（残っている）は避けてください");
+	}
+	if (/じっくり選んで引け|選んで引ける|内容を確認してみてください|リンクから内容/.test(body)) {
+		reasons.push("不要または仕様とズレる誘導文を検出しました");
+	}
+	if (/実質的なロス|繰り返し引く選択肢|なりやすい/.test(body)) {
+		reasons.push("不自然な説明表現を検出しました");
+	}
 	if (/残り少|急げ|今すぐ|ラストチャンス/.test(body)) {
 		reasons.push("煽り表現を検出しました");
 	}
@@ -1636,6 +1658,9 @@ function validateDailyAiMessage(
 	}
 	if (/リターンより|体験を楽し|選ぶときの目安|目安になる/.test(text)) {
 		reasons.push("消極的で訴求が弱い文言を検出しました");
+	}
+	if (/実質的なロス|繰り返し引く選択肢|選択肢にもなりやすい/.test(text)) {
+		reasons.push("不自然で訴求が弱い文言を検出しました");
 	}
 	if (/[0-9]+人に1人/.test(text)) {
 		reasons.push("『N人に1人』表現は禁止です");
@@ -1731,10 +1756,10 @@ function getRequiredHashtags(
 	const productTag =
 		inferProductHashtag(selected.name) ||
 		inferHashtagFromDetailFacts(detailFacts) ||
-		"#ポケカ";
+		inferCategoryHashtag(selected.name);
 	if (pattern === "urgency") {
-		// Keep urgency posts concise: one tag only.
-		return ["#ポケカ"];
+		// Keep urgency posts concise: one tag only if relevant.
+		return productTag ? [productTag] : [];
 	}
 	return productTag ? [productTag] : [];
 }
@@ -1763,6 +1788,13 @@ function inferProductHashtag(name: string): string | null {
 	];
 	const hit = rules.find((r) => r.re.test(text));
 	return hit?.tag ?? null;
+}
+
+function inferCategoryHashtag(name: string): string | null {
+	const text = String(name ?? "");
+	if (/ワンピ|one\s*piece|ロマドン|ロケット団の栄光/u.test(text)) return "#ワンピカード";
+	if (/ポケカ|ポケモン|ピカチュウ|リザードン|ナンジャモ|リーリエ|sv\d+/iu.test(text)) return "#ポケカ";
+	return null;
 }
 
 function extractHashtags(text: string): string[] {
@@ -1815,6 +1847,7 @@ async function runMonitor(
 	const activeForceLevel = forceLevel ?? requestForceLevel;
 
 	const stateStore = createStateStore(env);
+	const marketContext = await getLatestMarketContext(stateStore);
 	const items = await fetchAllCandidateItems();
 
 	const results: Array<Record<string, unknown>> = [];
@@ -1825,6 +1858,7 @@ async function runMonitor(
 
 		const pickedTitle = pickTitle(item, detail);
 		const title = pickedTitle.title;
+		const matchedMarketContext = pickAlertMarketContext(title, marketContext);
 
 		const under5Key = `${item.source}:${item.url}:under5`;
 		const under1Key = `${item.source}:${item.url}:under1`;
@@ -1851,6 +1885,7 @@ async function runMonitor(
 				url: item.url,
 				level: "under_1",
 				includeLastPrize: Boolean(detail.lastOneImageUrl),
+				marketContext: matchedMarketContext,
 			});
 
 			if (commit) {
@@ -1881,6 +1916,7 @@ async function runMonitor(
 				url: item.url,
 				level: "under_5",
 				includeLastPrize: Boolean(detail.lastOneImageUrl),
+				marketContext: matchedMarketContext,
 			});
 
 			if (commit) {
@@ -1920,6 +1956,7 @@ async function runMonitor(
 						percent: detail.percent,
 						mainImageUrl: detail.mainImageUrl,
 						lastOneImageUrl: detail.lastOneImageUrl,
+						marketContext: matchedMarketContext,
 						committed,
 						postedToX,
 						xResponse,
@@ -1944,6 +1981,7 @@ async function runMonitor(
 			mainImageUrl: detail.mainImageUrl,
 			lastOneImageUrl: detail.lastOneImageUrl,
 			imageUrls: detail.imageUrls,
+			marketContext: matchedMarketContext,
 			under5Posted,
 			under1Posted,
 			action,
@@ -1992,6 +2030,7 @@ function buildAlertMessage({
 	url,
 	level,
 	includeLastPrize,
+	marketContext,
 }: {
 	source: MonitorSource;
 	title: string;
@@ -2000,6 +2039,7 @@ function buildAlertMessage({
 	url: string;
 	level: AlertLevel;
 	includeLastPrize: boolean;
+	marketContext: LatestMarketContext | null;
 }): string {
 	if (source === "mercari") {
 		return buildMercariAlertMessage({
@@ -2009,6 +2049,7 @@ function buildAlertMessage({
 			url,
 			level,
 			includeLastPrize,
+			marketContext,
 		});
 	}
 	const safeRemaining = Number.isFinite(remaining) ? String(remaining) : "?";
@@ -2029,6 +2070,10 @@ function buildAlertMessage({
 	if (includeLastPrize) {
 		lines.push(`${hotIcon} ${lastPrizeLabel}を狙え`, "");
 	}
+	const marketLine = buildAlertMarketLine(marketContext);
+	if (marketLine) {
+		lines.push(marketLine, "");
+	}
 	lines.push(url);
 
 	return lines.join("\n");
@@ -2041,6 +2086,7 @@ function buildMercariAlertMessage({
 	url,
 	level,
 	includeLastPrize,
+	marketContext,
 }: {
 	title: string;
 	remaining: number | null;
@@ -2048,6 +2094,7 @@ function buildMercariAlertMessage({
 	url: string;
 	level: AlertLevel;
 	includeLastPrize: boolean;
+	marketContext: LatestMarketContext | null;
 }): string {
 	const safeRemaining = Number.isFinite(remaining) ? formatNumber(remaining as number) : "?";
 	const safeTotal = Number.isFinite(totalCount) ? formatNumber(totalCount as number) : "?";
@@ -2086,6 +2133,10 @@ function buildMercariAlertMessage({
 	if (includeLastPrize) {
 		lines.push("🏆 ラスイチ賞を狙え", "");
 	}
+	const marketLine = buildAlertMarketLine(marketContext);
+	if (marketLine) {
+		lines.push(marketLine, "");
+	}
 	lines.push(closePair[0], closePair[1], "", url);
 	return lines.join("\n");
 }
@@ -2097,6 +2148,29 @@ function hashSeed(input: string): number {
 		h = Math.imul(h, 16777619);
 	}
 	return h >>> 0;
+}
+
+function pickAlertMarketContext(
+	title: string,
+	marketContext: LatestMarketContext | null,
+): LatestMarketContext | null {
+	if (!marketContext) return null;
+	if (!Number.isFinite(marketContext.changePct) || marketContext.changePct < ALERT_MARKET_CHANGE_PCT_MIN) {
+		return null;
+	}
+	const keyword = normalizeMatchText(extractTrendKeyword(marketContext.card));
+	if (!keyword) return null;
+	const normalizedTitle = normalizeMatchText(title);
+	if (!normalizedTitle.includes(keyword) && !keyword.includes(normalizedTitle)) return null;
+	return marketContext;
+}
+
+function buildAlertMarketLine(marketContext: LatestMarketContext | null): string | null {
+	if (!marketContext) return null;
+	const before = formatNumber(marketContext.beforePrice);
+	const after = formatNumber(marketContext.afterPrice);
+	const pct = Number(marketContext.changePct).toFixed(2);
+	return `📈 ${marketContext.card}: ${before}円 → ${after}円（+${pct}%）`;
 }
 
 async function postTweetWithImages(
@@ -2841,17 +2915,30 @@ async function appendRecentUrlHistory(stateStore: StateStore, key: string, url: 
 
 async function getLatestMarketContext(
 	stateStore: StateStore,
-): Promise<{ card: string; fetchedAt: string } | null> {
+): Promise<LatestMarketContext | null> {
 	const raw = await stateStore.get(LATEST_MARKET_CONTEXT_KEY);
 	if (!raw) return null;
 	try {
-		const parsed = JSON.parse(raw) as { card?: string; fetchedAt?: string; recordedAt?: string };
+		const parsed = JSON.parse(raw) as {
+			card?: string;
+			fetchedAt?: string;
+			recordedAt?: string;
+			beforePrice?: number;
+			afterPrice?: number;
+			changePct?: number;
+		};
 		const card = String(parsed.card ?? "").trim();
 		const fetchedAt = String(parsed.fetchedAt ?? parsed.recordedAt ?? "").trim();
 		if (!card || !fetchedAt) return null;
 		const ageMs = Date.now() - new Date(fetchedAt).getTime();
 		if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > 1000 * 60 * 60 * 72) return null;
-		return { card, fetchedAt };
+		const beforePrice = Number(parsed.beforePrice ?? NaN);
+		const afterPrice = Number(parsed.afterPrice ?? NaN);
+		const changePct = Number(parsed.changePct ?? NaN);
+		if (!Number.isFinite(beforePrice) || !Number.isFinite(afterPrice) || !Number.isFinite(changePct)) {
+			return null;
+		}
+		return { card, fetchedAt, beforePrice, afterPrice, changePct };
 	} catch {
 		return null;
 	}
@@ -2859,7 +2946,7 @@ async function getLatestMarketContext(
 
 function prioritizeCandidatesByMarketContext(
 	candidates: TcgStoreOripaCandidate[],
-	marketContext: { card: string; fetchedAt: string } | null,
+	marketContext: LatestMarketContext | null,
 ): TcgStoreOripaCandidate[] {
 	if (!marketContext) return [];
 	const keyword = normalizeMatchText(extractTrendKeyword(marketContext.card));
@@ -2869,7 +2956,7 @@ function prioritizeCandidatesByMarketContext(
 
 function prioritizeMercariCandidatesByMarketContext(
 	candidates: Array<{ item: CandidateItem; detail: ItemDetail; title: PickedTitle }>,
-	marketContext: { card: string; fetchedAt: string } | null,
+	marketContext: LatestMarketContext | null,
 ): Array<{ item: CandidateItem; detail: ItemDetail; title: PickedTitle }> {
 	if (!marketContext) return [];
 	const keyword = normalizeMatchText(extractTrendKeyword(marketContext.card));
