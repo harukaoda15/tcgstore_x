@@ -116,12 +116,24 @@ type MonitorEnv = Env & {
 	X_ACCESS_TOKEN_SECRET?: string;
 	ANTHROPIC_API_KEY?: string;
 	ANTHROPIC_MODEL?: string;
+	TELEGRAM_BOT_TOKEN?: string;
+	TELEGRAM_CHAT_ID?: string;
+	APPROVE_SECRET_TOKEN?: string;
 };
 
 type StateStore = {
 	get: (key: string) => Promise<string | null>;
 	put: (key: string, value: string) => Promise<void>;
 };
+
+type PendingPost = {
+	message: string;
+	mainImageUrl: string | null;
+	lastOneImageUrl: string | null;
+	source: string;
+	createdAt: string;
+};
+const PENDING_POST_TTL_SECONDS = 7200;
 
 const localStateFallback = new Map<string, string>();
 const TCGSTORE_LAST_URL_KEY = "last_oripa_url";
@@ -198,6 +210,19 @@ const MERCARI_DAILY_AI_SYSTEM_PROMPT = `あなたはTCGSTOREのX運用担当。
 - 行き過ぎた煽りは禁止
 - URLは末尾に1回だけ`;
 
+async function sendTelegram(text: string, env: MonitorEnv): Promise<void> {
+	if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+	await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			chat_id: env.TELEGRAM_CHAT_ID,
+			text,
+			parse_mode: "HTML",
+		}),
+	});
+}
+
 export default {
 	async fetch(request: Request, env: MonitorEnv): Promise<Response> {
 		const reqUrl = new URL(request.url);
@@ -249,10 +274,71 @@ export default {
 			});
 			return jsonResponse(result);
 		}
+		if (mode === "web3_daily") {
+			const commit = reqUrl.searchParams.get("commit") === "1";
+			const result = await runDailyWeb3Info(env, { commit, logToConsole: true });
+			return jsonResponse(result);
+		}
 		if (mode === "price_spike") {
 			const commit = reqUrl.searchParams.get("commit") === "1";
 			const result = await runPriceSpikeMode(request, env, { commit, logToConsole: true });
 			return jsonResponse(result);
+		}
+
+		if (reqUrl.pathname === "/approve") {
+			const token = reqUrl.searchParams.get("token");
+			const key = reqUrl.searchParams.get("key");
+			if (!token || token !== env.APPROVE_SECRET_TOKEN) {
+				return new Response("Invalid token", { status: 400 });
+			}
+			if (!key || !env.STATE) {
+				return new Response(
+					"<html><body style=\"font-family:sans-serif;padding:2rem\"><h1>❌ 承認期限切れまたは無効</h1></body></html>",
+					{ status: 404, headers: { "content-type": "text/html;charset=utf-8" } },
+				);
+			}
+			const raw = await env.STATE.get(key);
+			if (!raw) {
+				return new Response(
+					"<html><body style=\"font-family:sans-serif;padding:2rem\"><h1>❌ 承認期限切れまたは無効</h1></body></html>",
+					{ status: 404, headers: { "content-type": "text/html;charset=utf-8" } },
+				);
+			}
+			let pending: PendingPost;
+			try {
+				pending = JSON.parse(raw) as PendingPost;
+			} catch {
+				return new Response(
+					"<html><body style=\"font-family:sans-serif;padding:2rem\"><h1>❌ データが破損しています</h1></body></html>",
+					{ status: 500, headers: { "content-type": "text/html;charset=utf-8" } },
+				);
+			}
+			try {
+				const postResult = await postTweetWithImages(
+					pending.message,
+					{ mainImageUrl: pending.mainImageUrl, lastOneImageUrl: pending.lastOneImageUrl },
+					env,
+				);
+				await env.STATE.delete(key);
+				if (postResult.ok) {
+					await sendTelegram(`✅ X投稿しました（${pending.source}）\n\n${pending.message}`, env);
+					return new Response(
+						`<html><body style="font-family:sans-serif;padding:2rem"><h1>✅ 投稿しました！</h1><pre>${pending.message}</pre></body></html>`,
+						{ status: 200, headers: { "content-type": "text/html;charset=utf-8" } },
+					);
+				}
+				await sendTelegram(`❌ X投稿に失敗しました（${pending.source}）`, env);
+				return new Response(
+					"<html><body style=\"font-family:sans-serif;padding:2rem\"><h1>❌ 投稿に失敗しました</h1></body></html>",
+					{ status: 500, headers: { "content-type": "text/html;charset=utf-8" } },
+				);
+			} catch (err) {
+				await sendTelegram(`❌ X投稿でエラーが発生しました（${pending.source}）: ${err instanceof Error ? err.message : String(err)}`, env);
+				return new Response(
+					"<html><body style=\"font-family:sans-serif;padding:2rem\"><h1>❌ エラーが発生しました</h1></body></html>",
+					{ status: 500, headers: { "content-type": "text/html;charset=utf-8" } },
+				);
+			}
 		}
 
 		return runMonitor(request, env, {
@@ -272,8 +358,8 @@ export default {
 			forceCommit: true,
 			logToConsole: true,
 		});
-		if (isDailySpotlightCron(event)) {
-			await runDailyRandomSpotlight(env, {
+		if (isDailyWeb3InfoCron(event)) {
+			await runDailyWeb3Info(env, {
 				commit: true,
 				logToConsole: true,
 				fromSchedule: true,
@@ -376,22 +462,43 @@ async function runDailyTcgStoreSpotlight(
 	let postedToX = false;
 	let committed = false;
 	let xResponse: unknown = null;
+	let pendingKey: string | undefined;
+	let telegramNotified = false;
 
 	if (commit) {
-		const postResult = await postTweetWithImages(
-			message,
-			{
+		if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE) {
+			const key = `pending_post:${crypto.randomUUID()}`;
+			const pending: PendingPost = {
+				message,
 				mainImageUrl: selected.mainImageUrl,
 				lastOneImageUrl: null,
-			},
-			env,
-		);
-		postedToX = postResult.ok;
-		xResponse = postResult;
-		if (postResult.ok) {
-			await stateStore.put(TCGSTORE_LAST_URL_KEY, selected.url);
-			await appendRecentUrlHistory(stateStore, TCGSTORE_RECENT_URLS_KEY, selected.url);
-			committed = true;
+				source: "tcgstore",
+				createdAt: new Date().toISOString(),
+			};
+			await env.STATE.put(key, JSON.stringify(pending), { expirationTtl: PENDING_POST_TTL_SECONDS });
+			const approveUrl = `https://tcgstore-x.harukaoda15.workers.dev/approve?key=${key}&token=${env.APPROVE_SECRET_TOKEN}`;
+			await sendTelegram(
+				`📝 投稿プレビュー（tcgstore）\n\n${message}\n\n---\n✅ 承認する場合はこちら:\n${approveUrl}\n\n⏰ 2時間以内に承認してください`,
+				env,
+			);
+			pendingKey = key;
+			telegramNotified = true;
+		} else {
+			const postResult = await postTweetWithImages(
+				message,
+				{
+					mainImageUrl: selected.mainImageUrl,
+					lastOneImageUrl: null,
+				},
+				env,
+			);
+			postedToX = postResult.ok;
+			xResponse = postResult;
+			if (postResult.ok) {
+				await stateStore.put(TCGSTORE_LAST_URL_KEY, selected.url);
+				await appendRecentUrlHistory(stateStore, TCGSTORE_RECENT_URLS_KEY, selected.url);
+				committed = true;
+			}
 		}
 	}
 
@@ -433,6 +540,8 @@ async function runDailyTcgStoreSpotlight(
 		postedToX,
 		committed,
 		xResponse,
+		pendingKey,
+		telegramNotified,
 	};
 
 	if (logToConsole) {
@@ -444,6 +553,143 @@ async function runDailyTcgStoreSpotlight(
 
 function isDailySpotlightCron(event: ScheduledEvent): boolean {
 	return event.cron === "0 3 * * *" || event.cron === "0 12 * * *";
+}
+
+function isDailyWeb3InfoCron(event: ScheduledEvent): boolean {
+	return event.cron === "0 11 * * *" || event.cron === "0 14 * * *";
+}
+
+type DailyWeb3InfoOptions = {
+	commit?: boolean;
+	logToConsole?: boolean;
+	fromSchedule?: boolean;
+};
+
+async function fetchPokecaChartTrending(): Promise<string> {
+	try {
+		const res = await fetch("https://pokeca-chart.com/", {
+			headers: { "user-agent": "Mozilla/5.0" },
+		});
+		if (!res.ok) return "";
+		const html = await res.text();
+
+		// Extract ranking sections by finding h2 headings and their following content
+		const targetSections = ["高騰ランキング", "下落ランキング", "取引件数ランキング"];
+		const extracted: string[] = [];
+
+		for (const section of targetSections) {
+			// Find the h2 tag containing the section name, then grab content until next h2
+			const sectionRegex = new RegExp(
+				`<h2[^>]*>[^<]*${section}[^<]*<\\/h2>([\\s\\S]*?)(?=<h2[^>]*>|$)`,
+				"i",
+			);
+			const match = html.match(sectionRegex);
+			if (match) {
+				const sectionText = stripTags(match[0]).replace(/\s+/g, " ").trim();
+				if (sectionText) extracted.push(sectionText);
+			}
+		}
+
+		if (extracted.length > 0) {
+			return extracted.join("\n\n").slice(0, 2000);
+		}
+
+		// Fallback: return full page text
+		return stripTags(html).replace(/\s+/g, " ").trim().slice(0, 2000);
+	} catch {
+		return "";
+	}
+}
+
+async function runDailyWeb3Info(
+	env: MonitorEnv,
+	options: DailyWeb3InfoOptions = {},
+): Promise<Record<string, unknown>> {
+	const { commit = false, logToConsole = true, fromSchedule = false } = options;
+
+	const trendingData = await fetchPokecaChartTrending();
+	if (!trendingData) {
+		const result = { ok: false, reason: "fetch_failed", fromSchedule, committed: false, postedToX: false };
+		if (logToConsole) console.log(JSON.stringify({ type: "WEB3_DAILY_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	if (!env.ANTHROPIC_API_KEY) {
+		const result = { ok: false, reason: "missing_anthropic_api_key", fromSchedule, committed: false, postedToX: false };
+		if (logToConsole) console.log(JSON.stringify({ type: "WEB3_DAILY_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const model = env.ANTHROPIC_MODEL ?? "claude-haiku-4-5-20251001";
+	const system = `あなたはWeb3×ポケモンカード情報を発信するXアカウントの運用担当です。
+- ポケカ投資家・コレクター向けに価格・トレンド情報を中立的に伝える
+- 煽りや断定予測は禁止
+- 具体的な数字があれば積極的に使う
+- 100〜140文字以内
+- ハッシュタグは #ポケカ のみ
+- 絵文字は0〜1個`;
+	const prompt = `以下のpokeca-chartのトレンドデータを元に、今日のポケカ市場トレンドをX投稿文として1本作成してください。
+
+${trendingData}
+
+【ルール】
+- 具体的なカード名・価格があれば使う
+- 「〜かも」「〜の可能性」など推察ベースで書く
+- URLは含めない
+- ハッシュタグ: #ポケカ のみ`;
+
+	const aiResponse = await callAnthropicTextGeneration({ system, prompt, apiKey: env.ANTHROPIC_API_KEY, model });
+	if (!aiResponse.ok || !aiResponse.text) {
+		const result = { ok: false, reason: aiResponse.reason ?? "ai_failed", fromSchedule, committed: false, postedToX: false };
+		if (logToConsole) console.log(JSON.stringify({ type: "WEB3_DAILY_SKIP_AI", ...result }, null, 2));
+		return result;
+	}
+
+	const message = aiResponse.text.replace(/```[\s\S]*?```/g, " ").replace(/https?:\/\/\S+/g, "").trim();
+
+	let postedToX = false;
+	let committed = false;
+	let pendingKey: string | undefined;
+	let telegramNotified = false;
+
+	if (commit) {
+		if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE) {
+			const key = `pending_post:${crypto.randomUUID()}`;
+			const pending: PendingPost = {
+				message,
+				mainImageUrl: null,
+				lastOneImageUrl: null,
+				source: "web3_info",
+				createdAt: new Date().toISOString(),
+			};
+			await env.STATE.put(key, JSON.stringify(pending), { expirationTtl: PENDING_POST_TTL_SECONDS });
+			const approveUrl = `https://tcgstore-x.harukaoda15.workers.dev/approve?key=${key}&token=${env.APPROVE_SECRET_TOKEN}`;
+			await sendTelegram(
+				`📝 投稿プレビュー（web3_info）\n\n${message}\n\n---\n✅ 承認する場合はこちら:\n${approveUrl}\n\n⏰ 2時間以内に承認してください`,
+				env,
+			);
+			pendingKey = key;
+			telegramNotified = true;
+		} else {
+			const postResult = await postTweetWithImages(message, { mainImageUrl: null, lastOneImageUrl: null }, env);
+			postedToX = postResult.ok;
+			if (postResult.ok) committed = true;
+		}
+	}
+
+	const result = {
+		ok: true,
+		source: "web3_info",
+		fromSchedule,
+		previewMessage: message,
+		trendingDataLength: trendingData.length,
+		pendingKey,
+		telegramNotified,
+		postedToX,
+		committed,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "WEB3_DAILY_RESULT", ...result }, null, 2));
+	return result;
 }
 
 async function runDailyRandomSpotlight(
@@ -948,18 +1194,39 @@ async function runDailyMercariSpotlight(
 	let postedToX = false;
 	let committed = false;
 	let xResponse: unknown = null;
+	let pendingKey: string | undefined;
+	let telegramNotified = false;
 	if (commit) {
-		const postResult = await postTweetWithImages(
-			message,
-			{ mainImageUrl: selected.detail.mainImageUrl, lastOneImageUrl: null },
-			env,
-		);
-		postedToX = postResult.ok;
-		xResponse = postResult;
-		if (postResult.ok) {
-			await stateStore.put(MERCARI_LAST_URL_KEY, selected.item.url);
-			await appendRecentUrlHistory(stateStore, MERCARI_RECENT_URLS_KEY, selected.item.url);
-			committed = true;
+		if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE) {
+			const key = `pending_post:${crypto.randomUUID()}`;
+			const pending: PendingPost = {
+				message,
+				mainImageUrl: selected.detail.mainImageUrl,
+				lastOneImageUrl: null,
+				source: "mercari",
+				createdAt: new Date().toISOString(),
+			};
+			await env.STATE.put(key, JSON.stringify(pending), { expirationTtl: PENDING_POST_TTL_SECONDS });
+			const approveUrl = `https://tcgstore-x.harukaoda15.workers.dev/approve?key=${key}&token=${env.APPROVE_SECRET_TOKEN}`;
+			await sendTelegram(
+				`📝 投稿プレビュー（mercari）\n\n${message}\n\n---\n✅ 承認する場合はこちら:\n${approveUrl}\n\n⏰ 2時間以内に承認してください`,
+				env,
+			);
+			pendingKey = key;
+			telegramNotified = true;
+		} else {
+			const postResult = await postTweetWithImages(
+				message,
+				{ mainImageUrl: selected.detail.mainImageUrl, lastOneImageUrl: null },
+				env,
+			);
+			postedToX = postResult.ok;
+			xResponse = postResult;
+			if (postResult.ok) {
+				await stateStore.put(MERCARI_LAST_URL_KEY, selected.item.url);
+				await appendRecentUrlHistory(stateStore, MERCARI_RECENT_URLS_KEY, selected.item.url);
+				committed = true;
+			}
 		}
 	}
 	const result = {
@@ -989,6 +1256,8 @@ async function runDailyMercariSpotlight(
 		postedToX,
 		committed,
 		xResponse,
+		pendingKey,
+		telegramNotified,
 	};
 	if (logToConsole) console.log(JSON.stringify({ type: "MERCARI_DAILY_RESULT", ...result }, null, 2));
 	return result;
