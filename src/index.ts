@@ -96,6 +96,7 @@ type ItemDetail = {
 	percent: number | null;
 	hasLastOnePrize: boolean;
 	detailTextHint: string;
+	topPrizeNames: string[];
 	mainImageUrl: string | null;
 	lastOneImageUrl: string | null;
 	imageUrls: string[];
@@ -927,6 +928,7 @@ async function runDailyMercariSpotlight(
 		url: selected.item.url,
 		remaining: selected.detail.detailRemaining,
 		totalCount: selected.detail.totalCount,
+		topPrizeNames: selected.detail.topPrizeNames,
 		env,
 		marketContext,
 	});
@@ -953,6 +955,14 @@ async function runDailyMercariSpotlight(
 			message,
 			{ mainImageUrl: selected.detail.mainImageUrl, lastOneImageUrl: null },
 			env,
+			{
+				mainImageAlt: buildMercariDailyImageAlt(
+					selected.title.title,
+					selected.detail.topPrizeNames,
+					selected.detail.detailRemaining,
+					selected.detail.totalCount,
+				),
+			},
 		);
 		postedToX = postResult.ok;
 		xResponse = postResult;
@@ -977,6 +987,7 @@ async function runDailyMercariSpotlight(
 			remaining: selected.detail.detailRemaining,
 			totalCount: selected.detail.totalCount,
 			percent: selected.detail.percent,
+			topPrizeNames: selected.detail.topPrizeNames,
 			mainImageUrl: selected.detail.mainImageUrl,
 		},
 		lastPostedUrl: lastUrl,
@@ -999,6 +1010,7 @@ async function generateDailyMercariAiMessage({
 	url,
 	remaining,
 	totalCount,
+	topPrizeNames,
 	env,
 	marketContext,
 }: {
@@ -1006,6 +1018,7 @@ async function generateDailyMercariAiMessage({
 	url: string;
 	remaining: number | null;
 	totalCount: number | null;
+	topPrizeNames: string[];
 	env: MonitorEnv;
 	marketContext: LatestMarketContext | null;
 }): Promise<{ ok: boolean; message?: string; reason?: string; model: string | null }> {
@@ -1017,10 +1030,14 @@ async function generateDailyMercariAiMessage({
 		Number.isFinite(remaining) && Number.isFinite(totalCount) && totalCount && totalCount > 0
 			? `残り${formatNumber(remaining as number)}回（全${formatNumber(totalCount)}回）`
 			: "販売中のくじをピックアップ";
+	const topPrizeText = topPrizeNames.length > 0 ? topPrizeNames.slice(0, 4).join(" / ") : "未取得";
+	const preferredTags = inferMercariTags(topPrizeNames).join(" ");
 	const prompt = [
 		"メルカリくじの紹介投稿を1本作成してください。",
 		`商品名: ${title}`,
 		`在庫情報: ${rem}`,
+		`S賞/1等カード候補: ${topPrizeText}`,
+		`推奨ハッシュタグ: ${preferredTags || "なし"}`,
 		`商品URL: ${url}`,
 		`直近の市場注目カード: ${marketContext?.card ?? "なし"}`,
 		`市場注目取得時刻: ${marketContext?.fetchedAt ?? "なし"}`,
@@ -1028,11 +1045,12 @@ async function generateDailyMercariAiMessage({
 		"【出力ルール】",
 		"- 本文は2〜4行、最後の行はURLのみ",
 		"- 1行目は商品名から始めない。読み手メリットや事実から始める",
-		"- 絵文字は0〜1個まで。ハッシュタグは禁止",
+		"- 絵文字は0〜1個まで。ハッシュタグは推奨ハッシュタグのみ最大2個まで",
 		"- 売り込み口調を避け、事実ベースで簡潔に書く",
 		"- 在庫表現は「まだ引ける」「まだ回せる」を優先し、「残っている」を避ける",
 		"- 「じっくり選んで引ける」「内容を確認してみてください」など仕様とズレる誘導文を禁止",
 		"- 「実質的なロス」「繰り返し引く選択肢」など不自然な説明文を禁止",
+		"- S賞/1等カードがある場合はカード名を本文に最低1つ入れる",
 		"- 市場注目カードが商品名に含まれる場合だけ、関連を1フレーズで触れてよい",
 	].join("\n");
 	const response = await callAnthropicTextGeneration({
@@ -1045,11 +1063,15 @@ async function generateDailyMercariAiMessage({
 		return { ok: false, reason: response.reason ?? "anthropic_request_failed", model };
 	}
 	const normalized = normalizeDailyAiMessage(response.text, url);
-	const validation = validateMercariDailyAiMessage(normalized, url);
+	const normalizedWithPrize = enforceMercariTopPrizeMention(normalized, url, topPrizeNames);
+	const normalizedWithTags = applyMercariTagPolicy(normalizedWithPrize, url, topPrizeNames);
+	const tonedMessage = normalizeMercariStockTone(normalizedWithTags, url);
+	const fittedMessage = fitMercariDailyMessageLength(tonedMessage, url);
+	const validation = validateMercariDailyAiMessage(fittedMessage, url, topPrizeNames);
 	if (!validation.ok) {
 		return { ok: false, reason: validation.reasons.join(" / "), model };
 	}
-	return { ok: true, message: normalized, model };
+	return { ok: true, message: fittedMessage, model };
 }
 
 async function runDailyTcgStoreSamples(
@@ -1395,6 +1417,12 @@ function buildDailyTcgStoreAiUserPrompt({
 		"- ★最重要★ 投稿の冒頭（1行目）は商品名ではなく、読み手にとっての具体的メリット・数値的事実から始めること",
 		"  例: 「最低保証1,100coin・赤字なしで引ける」「1口999coinで〇〇狙い」「1日1回限定で試せる」",
 		"  NG: 「⚡黒炎の舞」のような商品名だけの冒頭",
+		"- @tcgstore_io の実績フォーマットを優先し、1行目は『狙いカード + 価格の入口』を短く提示する",
+		"  例: 「ピカチュウex狙い、180coinから。」",
+		"  例: 「リザードンex SAR、今ここで狙える。」",
+		"- 2行目は『試しやすさ・価格帯メリット』を簡潔に述べる",
+		"  例: 「試しやすい価格帯の入口。」",
+		"- 市場価格（相場◯円）の具体値は、入力データに明示された場合のみ使用可。未提供なら書かない",
 		...(lengthMode === "short"
 			? [
 					"- ★文字数モード: short★ URL込みで60〜90文字。1〜2文で要点だけサラッと書く。余計な説明は不要。",
@@ -1550,13 +1578,16 @@ function normalizeDailyAiMessage(text: string, url: string): string {
 	return `${withoutUrls}\n${url}`.trim();
 }
 
-function validateMercariDailyAiMessage(text: string, url: string): { ok: boolean; reasons: string[] } {
+function validateMercariDailyAiMessage(
+	text: string,
+	url: string,
+	topPrizeNames: string[],
+): { ok: boolean; reasons: string[] } {
 	const reasons: string[] = [];
 	const length = countXLength(text);
 	if (length < 70) reasons.push(`文字数不足(${length})`);
 	if (length > 150) reasons.push(`文字数超過(${length})`);
 	if (!text.endsWith(url)) reasons.push("URLは末尾に配置してください");
-	if (/#[\p{L}\p{N}_]+/u.test(text)) reasons.push("ハッシュタグは禁止です");
 	const body = text.replace(url, "").trim();
 	if (countEmoji(body) > 1) reasons.push("絵文字は0〜1個までにしてください");
 	const firstLine = body.split(/\n/).find(Boolean) ?? "";
@@ -1567,14 +1598,26 @@ function validateMercariDailyAiMessage(text: string, url: string): { ok: boolean
 	if (/残っている|残ってる/.test(body)) {
 		reasons.push("在庫のネガティブ表現（残っている）は避けてください");
 	}
+	if (/全\s*[0-9,]+\s*回中|現在\s*[0-9,]+\s*回(?:分)?/.test(body)) {
+		reasons.push("全体母数と残数の比較表現は禁止です");
+	}
 	if (/じっくり選んで引け|選んで引ける|内容を確認してみてください|リンクから内容/.test(body)) {
 		reasons.push("不要または仕様とズレる誘導文を検出しました");
 	}
 	if (/実質的なロス|繰り返し引く選択肢|なりやすい/.test(body)) {
 		reasons.push("不自然な説明表現を検出しました");
 	}
+	if (/消化率|消化して/.test(body)) {
+		reasons.push("消化率ベースの表現は禁止です");
+	}
 	if (/残り少|急げ|今すぐ|ラストチャンス/.test(body)) {
 		reasons.push("煽り表現を検出しました");
+	}
+	const expectedTags = inferMercariTags(topPrizeNames);
+	const foundTags = extractHashtags(body);
+	if (foundTags.length > 2) reasons.push("ハッシュタグは最大2個までです");
+	if (foundTags.some((tag) => !expectedTags.includes(tag))) {
+		reasons.push("S賞/1等カードと無関係なハッシュタグは禁止です");
 	}
 	return { ok: reasons.length === 0, reasons };
 }
@@ -1795,6 +1838,92 @@ function inferCategoryHashtag(name: string): string | null {
 	if (/ワンピ|one\s*piece|ロマドン|ロケット団の栄光/u.test(text)) return "#ワンピカード";
 	if (/ポケカ|ポケモン|ピカチュウ|リザードン|ナンジャモ|リーリエ|sv\d+/iu.test(text)) return "#ポケカ";
 	return null;
+}
+
+function inferMercariTags(topPrizeNames: string[]): string[] {
+	const tags: string[] = [];
+	for (const name of topPrizeNames) {
+		const sanitized = sanitizeCardNameForPost(name);
+		const mapped = inferProductHashtag(sanitized);
+		if (mapped) {
+			if (!tags.includes(mapped)) tags.push(mapped);
+			continue;
+		}
+		const direct = toDirectNameTag(sanitized);
+		if (direct && !tags.includes(direct)) tags.push(direct);
+		if (tags.length >= 2) break;
+	}
+	return tags.slice(0, 2);
+}
+
+function toDirectNameTag(name: string): string | null {
+	const cleaned = String(name ?? "")
+		.replace(/PSA\d+|プロモ|SAR|SR|UR|HR|AR|RRR|RR|R/gi, " ")
+		.replace(/\bSV[0-9A-Z\-_/]+\b/gi, " ")
+		.replace(/\b[0-9]{1,3}\/[0-9]{1,3}\b/g, " ")
+		.replace(/[()[\]{}]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!cleaned) return null;
+	if (cleaned.length > 12) return null;
+	return `#${cleaned}`;
+}
+
+function applyMercariTagPolicy(text: string, url: string, topPrizeNames: string[]): string {
+	const required = inferMercariTags(topPrizeNames);
+	const body = text.replace(url, "").trim();
+	const withoutTags = body.replace(/#[\p{L}\p{N}_]+/gu, "").replace(/\s+/g, " ").trim();
+	const tagText = required.join(" ").trim();
+	const nextBody = tagText ? `${withoutTags} ${tagText}`.trim() : withoutTags;
+	return `${nextBody}\n${url}`.trim();
+}
+
+function enforceMercariTopPrizeMention(text: string, url: string, topPrizeNames: string[]): string {
+	if (topPrizeNames.length === 0) return text;
+	const body = text.replace(url, "").trim();
+	const bodyForMatch = normalizeMatchText(body.replace(/#[\p{L}\p{N}_]+/gu, " "));
+	const normalizedNames = topPrizeNames.map((name) => normalizeMatchText(sanitizeCardNameForPost(name)));
+	const hasMention = normalizedNames.some((name) => name && bodyForMatch.includes(name));
+	if (hasMention) return text;
+	const lead = sanitizeCardNameForPost(topPrizeNames[0] ?? "").trim();
+	if (!lead) return text;
+	return `1等候補は${lead}。\n${body}\n${url}`.trim();
+}
+
+function fitMercariDailyMessageLength(text: string, url: string): string {
+	let body = text.replace(url, "").trim();
+	let merged = `${body}\n${url}`.trim();
+	if (countXLength(merged) <= 150) return merged;
+
+	const lines = body.split("\n").map((line) => line.trim()).filter(Boolean);
+	if (lines.length > 2) {
+		body = lines.slice(0, 2).join("\n");
+		merged = `${body}\n${url}`.trim();
+		if (countXLength(merged) <= 150) return merged;
+	}
+
+	const budget = Math.max(20, 150 - 24); // reserve URL length + spacing
+	const flat = body.replace(/\s+/g, " ").trim();
+	let sliced = "";
+	for (const ch of flat) {
+		if (countXLength(sliced + ch) > budget) break;
+		sliced += ch;
+	}
+	return `${sliced.trim()}\n${url}`.trim();
+}
+
+function normalizeMercariStockTone(text: string, url: string): string {
+	let body = text.replace(url, "").trim();
+	body = body.replace(
+		/全\s*([0-9,]+)\s*回中[、,\s]*現在\s*([0-9,]+)\s*回(?:分)?(?:が)?\s*残って(?:いる)?(?:状態)?(?:です)?。?/g,
+		"まだ$2回引ける状態です。",
+	);
+	body = body.replace(
+		/全\s*([0-9,]+)\s*回(?:構成)?(?:で)?[、,\s]*現時点で(?:の)?\s*消化率\s*は?\s*[0-9]+(?:\.[0-9]+)?[%％]。?/g,
+		"",
+	);
+	body = body.replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+	return `${body}\n${url}`.trim();
 }
 
 function extractHashtags(text: string): string[] {
@@ -2177,6 +2306,7 @@ async function postTweetWithImages(
 	text: string,
 	images: { mainImageUrl?: string | null; lastOneImageUrl?: string | null },
 	env: MonitorEnv,
+	options: { mainImageAlt?: string | null; lastOneImageAlt?: string | null } = {},
 ): Promise<Record<string, unknown> & { ok: boolean }> {
 	const endpoint = "https://api.x.com/2/tweets";
 
@@ -2196,13 +2326,16 @@ async function postTweetWithImages(
 	const mediaIds: string[] = [];
 	const uploadedMedia: Array<Record<string, unknown>> = [];
 
-	const imageCandidates = [images.mainImageUrl || null, images.lastOneImageUrl || null].filter(
-		Boolean,
-	) as string[];
+	const imageCandidates: Array<{ url: string; altText: string | null }> = [
+		{ url: images.mainImageUrl || "", altText: options.mainImageAlt ?? null },
+		{ url: images.lastOneImageUrl || "", altText: options.lastOneImageAlt ?? null },
+	].filter((x) => Boolean(x.url));
 
-	const uniqueImageUrls = [...new Set(imageCandidates)];
-
-	for (const imageUrl of uniqueImageUrls) {
+	const seenImageUrl = new Set<string>();
+	for (const candidate of imageCandidates) {
+		if (seenImageUrl.has(candidate.url)) continue;
+		seenImageUrl.add(candidate.url);
+		const imageUrl = candidate.url;
 		const uploadResult = await uploadImageToX(imageUrl, env);
 
 		uploadedMedia.push({
@@ -2219,7 +2352,16 @@ async function postTweetWithImages(
 			};
 		}
 
-		mediaIds.push(String(uploadResult.mediaId));
+		const mediaId = String(uploadResult.mediaId);
+		mediaIds.push(mediaId);
+		if (candidate.altText && candidate.altText.trim()) {
+			const altResult = await setXMediaAltText(mediaId, candidate.altText.trim(), env);
+			uploadedMedia.push({
+				sourceUrl: imageUrl,
+				type: "alt_text",
+				...altResult,
+			});
+		}
 	}
 
 	const bodyObject: {
@@ -2331,6 +2473,46 @@ async function uploadImageToX(
 		ok: true,
 		status: res.status,
 		mediaId: String(data.media_id_string ?? ""),
+	};
+}
+
+async function setXMediaAltText(
+	mediaId: string,
+	altText: string,
+	env: MonitorEnv,
+): Promise<Record<string, unknown> & { ok: boolean; status: number }> {
+	const endpoint = "https://upload.twitter.com/1.1/media/metadata/create.json";
+	const body = JSON.stringify({
+		media_id: mediaId,
+		alt_text: { text: altText.slice(0, 1000) },
+	});
+	const authorization = await buildOAuth1Header({
+		method: "POST",
+		url: endpoint,
+		consumerKey: env.X_API_KEY ?? "",
+		consumerSecret: env.X_API_KEY_SECRET ?? "",
+		token: env.X_ACCESS_TOKEN ?? "",
+		tokenSecret: env.X_ACCESS_TOKEN_SECRET ?? "",
+	});
+	const res = await fetch(endpoint, {
+		method: "POST",
+		headers: {
+			Authorization: authorization,
+			"Content-Type": "application/json",
+		},
+		body,
+	});
+	const raw = await res.text();
+	let data: unknown = null;
+	try {
+		data = raw ? JSON.parse(raw) : {};
+	} catch {
+		data = { raw };
+	}
+	return {
+		ok: res.ok,
+		status: res.status,
+		data,
 	};
 }
 
@@ -3138,6 +3320,7 @@ async function fetchMercariItemDetail(url: string): Promise<ItemDetail> {
 
 	const hasLastOnePrize =
 		text.includes("ラスイチ") || text.includes("ラストワン") || text.includes("最後の1枚");
+	const topPrizeNames = extractMercariTopPrizeNames(html, text);
 
 	const imageUrls = extractImageUrls(html, "https://nft.jp.mercari.com");
 	const ogImageUrl = extractOgImageUrl(html, "https://nft.jp.mercari.com");
@@ -3161,6 +3344,7 @@ async function fetchMercariItemDetail(url: string): Promise<ItemDetail> {
 		percent,
 		hasLastOnePrize,
 		detailTextHint: text.slice(0, 400),
+		topPrizeNames,
 		mainImageUrl,
 		lastOneImageUrl,
 		imageUrls: imageUrls.slice(0, 10),
@@ -3214,6 +3398,7 @@ async function fetchTcgStoreItemDetail(url: string): Promise<ItemDetail> {
 		percent,
 		hasLastOnePrize: Boolean(lastOneImageUrl),
 		detailTextHint: text.slice(0, 400),
+		topPrizeNames: [],
 		mainImageUrl,
 		lastOneImageUrl,
 		imageUrls: imageUrls.slice(0, 10),
@@ -3256,6 +3441,38 @@ function extractMercariCandidateItems(html: string): CandidateItem[] {
 	}
 
 	return results;
+}
+
+function extractMercariTopPrizeNames(html: string, plainText: string): string[] {
+	const names: string[] = [];
+	const text = String(plainText ?? "").replace(/\s+/g, " ");
+	const rankPattern =
+		/(?:S賞|1等)\s*[:：]?\s*([^。]{1,120}?)(?=(?:[A-Z]賞|[0-9]等|ラスト|ラスイチ|残り|\/|¥|$))/gu;
+	for (const match of text.matchAll(rankPattern)) {
+		const block = String(match[1] ?? "");
+		for (const token of block.split(/[、,／/|]/)) {
+			const cleaned = sanitizeCardNameForPost(token)
+				.replace(/PSA鑑定済み|対象|が当たる|など/u, "")
+				.replace(/[:：]\s*[0-9]+\s*個.*$/u, "")
+				.replace(/[0-9]+\s*個/u, "")
+				.trim();
+			if (!cleaned || cleaned.length < 2) continue;
+			const shortName = cleaned.slice(0, 28).trim();
+			if (!names.includes(shortName)) names.push(shortName);
+			if (names.length >= 6) break;
+		}
+		if (names.length >= 6) break;
+	}
+	if (names.length > 0) return names;
+
+	const htmlPattern = /(?:S賞|1等)[\s\S]{0,1500}?<img[^>]+alt="([^"]+)"/giu;
+	for (const match of html.matchAll(htmlPattern)) {
+		const cleaned = sanitizeCardNameForPost(decodeHtmlEntities(String(match[1] ?? ""))).trim();
+		if (!cleaned || cleaned.length < 2) continue;
+		if (!names.includes(cleaned)) names.push(cleaned);
+		if (names.length >= 6) break;
+	}
+	return names;
 }
 
 function extractTcgStoreCandidateItems(html: string): CandidateItem[] {
@@ -3451,6 +3668,20 @@ function decodeEscapedUrl(value: string): string {
 	return String(value ?? "")
 		.replace(/\\\//g, "/")
 		.replace(/\\"/g, '"');
+}
+
+function buildMercariDailyImageAlt(
+	title: string,
+	topPrizeNames: string[],
+	remaining: number | null,
+	totalCount: number | null,
+): string {
+	const topPrizeText = topPrizeNames.length > 0 ? topPrizeNames.slice(0, 3).join(" / ") : "未取得";
+	const remainText =
+		Number.isFinite(remaining) && Number.isFinite(totalCount) && totalCount && totalCount > 0
+			? `残り${formatNumber(remaining as number)}回（全${formatNumber(totalCount)}回）`
+			: "販売中";
+	return `${title} | 1等候補: ${topPrizeText} | ${remainText}`.slice(0, 1000);
 }
 
 function scoreMercariImageUrl(url: string): number {
