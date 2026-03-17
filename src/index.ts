@@ -49,6 +49,7 @@ type PriceSpikeItem = {
 	source_site?: string;
 	source_url?: string;
 	image_url?: string;
+	imageUrl?: string | null;
 	history_prices?: Array<{ date: string; price: number }>;
 };
 
@@ -59,11 +60,14 @@ type PriceSpikePayload = {
 
 type WatchlistEntry = {
 	key: string;
+	cardName: string;
 	card: string;
 	cardId: string | null;
-	sourceSite: "snkrdunk" | "pokeca-chart" | null;
+	sourceUrl: string;
+	sourceSite: "snkrdunk" | "pokeca-chart";
 	firstSeenAt: string;
 	lastSeenAt: string;
+	currentPrice: number;
 	beforePrice: number;
 	afterPrice: number;
 	changePct: number;
@@ -158,6 +162,7 @@ const ALERT_THRESHOLDS: Record<MonitorSource, { low: number; high: number }> = {
 const WATCHLIST_KEY = "watchlist";
 const WATCHLIST_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const WATCHLIST_LIMIT = 20;
+const DAILY_SPOTLIGHT_ENABLED = false;
 const ENABLE_TCG_DAILY_SPOTLIGHT = false;
 const ENABLE_MERCARI_DAILY_SPOTLIGHT = false;
 const ENABLE_MARKET_SUMMARY_DAILY = true;
@@ -304,7 +309,7 @@ export default {
 		}
 		if (mode === "market_summary") {
 			const commit = reqUrl.searchParams.get("commit") === "1";
-			const result = await runDailyMarketSummaryPost(env, {
+			const result = await runMarketSummary(env, {
 				commit,
 				logToConsole: true,
 				fromSchedule: false,
@@ -312,7 +317,7 @@ export default {
 			return jsonResponse(result);
 		}
 		if (mode === "market_summary_preview") {
-			const result = await runDailyMarketSummaryPost(env, {
+			const result = await runMarketSummary(env, {
 				commit: false,
 				logToConsole: true,
 				fromSchedule: false,
@@ -337,8 +342,18 @@ export default {
 			forceCommit: true,
 			logToConsole: true,
 		});
+		if (DAILY_SPOTLIGHT_ENABLED && isDailySpotlightCron(event)) {
+			await runDailyRandomSpotlight(env, {
+				commit: true,
+				logToConsole: true,
+				fromSchedule: true,
+			});
+		}
+		if (event.cron === "0 11 * * *") {
+			await refreshWatchlistPrices(env, { logToConsole: true });
+		}
 		if (isMarketSummaryCron(event) && ENABLE_MARKET_SUMMARY_DAILY) {
-			await runDailyMarketSummaryPost(env, {
+			await runMarketSummary(env, {
 				commit: true,
 				logToConsole: true,
 				fromSchedule: true,
@@ -508,7 +523,7 @@ async function runDailyTcgStoreSpotlight(
 }
 
 function isDailySpotlightCron(event: ScheduledEvent): boolean {
-	return event.cron === "0 3 * * *" || event.cron === "0 12 * * *";
+	return event.cron === "0 3 * * *";
 }
 
 function isMarketSummaryCron(event: ScheduledEvent): boolean {
@@ -639,7 +654,7 @@ async function runPriceSpikeMode(
 		if (commit) {
 			const postResult = await postTweetWithImages(
 				previewMessage,
-				{ mainImageUrl: null, lastOneImageUrl: null },
+				{ mainImageUrl: spike.image_url ?? spike.imageUrl ?? null, lastOneImageUrl: null },
 				env,
 			);
 			postedToX = postResult.ok;
@@ -677,7 +692,7 @@ async function runPriceSpikeMode(
 	}
 }
 
-async function runDailyMarketSummaryPost(
+async function runMarketSummary(
 	env: MonitorEnv,
 	options: { commit?: boolean; logToConsole?: boolean; fromSchedule?: boolean } = {},
 ): Promise<Record<string, unknown>> {
@@ -689,12 +704,10 @@ async function runDailyMarketSummaryPost(
 		if (logToConsole) console.log(JSON.stringify({ type: "MARKET_SUMMARY_SKIP", ...result }, null, 2));
 		return result;
 	}
-	const sorted = [...watchlist].sort((a, b) => {
-		const diffChange = Math.abs(b.changePct) - Math.abs(a.changePct);
-		if (diffChange !== 0) return diffChange;
-		return new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime();
-	});
-	const picked = sorted.slice(0, 3);
+	const jstNow = getJstNow();
+	const theme = getDailyMarketTheme(jstNow);
+	const sorted = sortWatchlistByTheme(watchlist, theme.sortBy, jstNow);
+	const picked = sorted.slice(0, 5);
 	if (picked.length < 3) {
 		const result = {
 			ok: false,
@@ -707,8 +720,8 @@ async function runDailyMarketSummaryPost(
 		if (logToConsole) console.log(JSON.stringify({ type: "MARKET_SUMMARY_SKIP", ...result }, null, 2));
 		return result;
 	}
-	const ai = await generateMarketSummaryMessage(picked, env);
-	const message = ai.ok && ai.message ? ai.message : buildMarketSummaryFallbackMessage(picked);
+	const ai = await generateMarketSummaryMessage(picked, theme, env);
+	const message = ai.ok && ai.message ? ai.message : buildMarketSummaryFallbackMessage(picked, theme);
 
 	let postedToX = false;
 	let committed = false;
@@ -739,6 +752,7 @@ async function runDailyMarketSummaryPost(
 		postedToX,
 		aiUsed: ai.ok,
 		aiReason: ai.reason ?? null,
+		theme,
 		watchlistCount: watchlist.length,
 		pickedCount: picked.length,
 		picked,
@@ -749,8 +763,60 @@ async function runDailyMarketSummaryPost(
 	return result;
 }
 
+async function refreshWatchlistPrices(
+	env: MonitorEnv,
+	options: { logToConsole?: boolean } = {},
+): Promise<Record<string, unknown>> {
+	const { logToConsole = true } = options;
+	const stateStore = createStateStore(env);
+	const current = await getWatchlistEntries(stateStore);
+	if (current.length === 0) {
+		const result = { ok: true, updated: 0, total: 0, reason: "watchlist_empty" };
+		if (logToConsole) console.log(JSON.stringify({ type: "WATCHLIST_REFRESH", ...result }, null, 2));
+		return result;
+	}
+	const nowIso = new Date().toISOString();
+	let updated = 0;
+	const next: WatchlistEntry[] = [];
+	for (const entry of current) {
+		try {
+			const page = await fetchPriceSpikeSourcePage(entry.sourceUrl);
+			const source = entry.sourceSite;
+			const pageOrigin = new URL(page.finalUrl || entry.sourceUrl).origin;
+			const ogImage = normalizeWatchImageUrl(extractOgImageUrl(page.html, pageOrigin), source);
+			const fetchedPrice = extractCurrentPriceFromSourceHtml(page.html);
+			const currentPrice: number =
+				typeof fetchedPrice === "number" && Number.isFinite(fetchedPrice) && fetchedPrice > 0
+					? fetchedPrice
+					: entry.currentPrice;
+			const hasMove = Number.isFinite(currentPrice) && currentPrice !== entry.currentPrice;
+			const merged: WatchlistEntry = {
+				...entry,
+				imageUrl: ogImage ?? entry.imageUrl ?? null,
+				beforePrice: hasMove ? entry.currentPrice : entry.beforePrice,
+				afterPrice: currentPrice,
+				currentPrice,
+				lastSeenAt: hasMove ? nowIso : entry.lastSeenAt,
+				priceHistory: appendWatchPriceHistory(entry.priceHistory, nowIso, currentPrice),
+			};
+			next.push(merged);
+			if (hasMove || (ogImage && ogImage !== entry.imageUrl)) updated += 1;
+		} catch {
+			next.push(entry);
+		}
+	}
+	const sorted = next
+		.sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime())
+		.slice(0, WATCHLIST_LIMIT);
+	await stateStore.put(WATCHLIST_KEY, JSON.stringify(sorted));
+	const result = { ok: true, updated, total: sorted.length };
+	if (logToConsole) console.log(JSON.stringify({ type: "WATCHLIST_REFRESH", ...result }, null, 2));
+	return result;
+}
+
 async function generateMarketSummaryMessage(
 	picked: WatchlistEntry[],
+	theme: { label: string; emoji: string; sortBy: "change_desc" | "change_asc" | "spike_recent" | "price_desc" },
 	env: MonitorEnv,
 ): Promise<{ ok: boolean; message?: string; reason?: string }> {
 	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
@@ -759,26 +825,27 @@ async function generateMarketSummaryMessage(
 	const lines = picked.map((item, idx) => {
 		const startPrice = getSummaryStartPrice(item);
 		const range = `${formatJstMonthDay(getSummaryRangeStartDate(item))}→${formatJstMonthDay(item.lastSeenAt)}`;
-		const pct = calcPercentChange(startPrice, item.afterPrice);
-		return `${idx + 1}. ${item.card} | emoji=${pickChangeEmoji(pct)} | ${formatNumber(startPrice)}円→${formatNumber(item.afterPrice)}円 | ${range} | ${signedPercentText(pct)}`;
+		const pct = calcPercentChange(startPrice, item.currentPrice);
+		return `${idx + 1}. rank=${getRankBadge(idx)} card=${item.cardName} changeEmoji=${getChangeEmoji(pct)} price=${formatNumber(startPrice)}→${formatNumber(item.currentPrice)} range=${range} pct=${signedPercentText(pct)}`;
 	});
 	const prompt = [
 		"以下の監視銘柄データを元に、X投稿文を1本作成してください。",
 		`日付ラベル: ${jstLabel}`,
+		`曜日テーマ: ${theme.label} (${theme.emoji})`,
 		"",
 		"【監視銘柄】",
 		...lines,
 		"",
-		"## 投稿フォーマット（厳守）",
-		"- 1行目：【日付(曜)ポケカ相場】",
-		"- 各カードの前に空行を入れる",
-		"- 絵文字はデータから渡されたものをそのまま使う（変えない）",
-		"- 価格は「前回価格→現在価格（期間 +XX%）」の形式",
-		"- 期間は「3/10→3/17」のように具体的な日付で書く",
-		"- 最後に #ポケカ",
-		"- URL含めない",
-		"- 3〜5件まとめる",
-		"- 煽り・断定・予測禁止",
+		"【投稿フォーマット（厳守）】",
+		`1行目: 【M/D(曜)${theme.label}】`,
+		"各カードの前に空行を入れる",
+		"順位は🥇🥈🥉で表示（4位以降は🏅）",
+		"価格: 前回価格円→現在価格円（期間 +XX.X%）",
+		"期間: firstSeenAtから今日の日付（例: 3/10→3/17）",
+		"最後に #ポケカ",
+		"URLは含めない",
+		"3〜5件まとめる",
+		"煽り・断定・予測禁止",
 	].join("\n");
 	const response = await callAnthropicTextGeneration({
 		system: MARKET_SUMMARY_SYSTEM_PROMPT,
@@ -807,7 +874,7 @@ function normalizeMarketSummaryMessage(text: string): string {
 	let consumed = 0;
 	while (consumed < body.length && normalizedBlocks.length < 12) {
 		const line = body[consumed];
-		if (!/^[✅📈📉⚡🔥]/.test(line)) {
+		if (!/^[🥇🥈🥉🏅]/.test(line)) {
 			consumed += 1;
 			continue;
 		}
@@ -825,10 +892,10 @@ function validateMarketSummaryMessage(text: string): { ok: boolean; reasons: str
 	const tags = extractHashtags(text);
 	if (tags.length !== 1 || tags[0] !== "#ポケカ") reasons.push("ハッシュタグは #ポケカ のみ");
 	const rows = text.split("\n").map((line) => line.trim()).filter(Boolean);
-	if (!/^【\d{1,2}\/\d{1,2}\(.+\)ポケカ相場】$/.test(rows[0] ?? "")) {
+	if (!/^【\d{1,2}\/\d{1,2}\(.+\).+】$/.test(rows[0] ?? "")) {
 		reasons.push("1行目の日付テーマ形式が不正です");
 	}
-	const bulletCount = rows.filter((line) => /^[✅📈📉⚡🔥]/.test(line)).length;
+	const bulletCount = rows.filter((line) => /^[🥇🥈🥉🏅]/.test(line)).length;
 	if (bulletCount < 3 || bulletCount > 5) reasons.push("箇条書きは3〜5件にしてください");
 	if (/急げ|爆アツ|絶対|確実|買うべき|まだ上がる/.test(text)) reasons.push("煽り/断定表現を検出");
 	if (!/[0-9][0-9,]*円/.test(text)) reasons.push("価格の具体数値が不足しています");
@@ -837,27 +904,93 @@ function validateMarketSummaryMessage(text: string): { ok: boolean; reasons: str
 	return { ok: reasons.length === 0, reasons };
 }
 
-function buildMarketSummaryFallbackMessage(picked: WatchlistEntry[]): string {
+function buildMarketSummaryFallbackMessage(
+	picked: WatchlistEntry[],
+	theme: { label: string },
+): string {
 	const label = getJstMarketSummaryLabel();
-	const lines: string[] = [`【${label}ポケカ相場】`];
-	for (const item of picked.slice(0, 5)) {
+	const lines: string[] = [`【${label}${theme.label}】`];
+	for (const [idx, item] of picked.slice(0, 5).entries()) {
 		const startPrice = getSummaryStartPrice(item);
-		const pct = calcPercentChange(startPrice, item.afterPrice);
-		const icon = pickChangeEmoji(pct);
-		const key = compactCardLabel(item.card);
+		const pct = calcPercentChange(startPrice, item.currentPrice);
+		const rank = getRankBadge(idx);
+		const key = compactCardLabel(item.cardName);
 		const range = `${formatJstMonthDay(getSummaryRangeStartDate(item))}→${formatJstMonthDay(item.lastSeenAt)}`;
-		lines.push("", `${icon}${key}`, `${formatNumber(startPrice)}円→${formatNumber(item.afterPrice)}円（${range} ${signedPercentText(pct)}）`);
+		lines.push("", `${rank} ${key}`, `${formatNumber(startPrice)}円→${formatNumber(item.currentPrice)}円（${range} ${signedPercentText(pct)}）`);
 	}
 	lines.push("", "#ポケカ");
 	return lines.join("\n");
 }
 
 function getJstMarketSummaryLabel(now = new Date()): string {
-	const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+	const jst = getJstNow(now);
 	const month = jst.getUTCMonth() + 1;
 	const date = jst.getUTCDate();
 	const day = ["日", "月", "火", "水", "木", "金", "土"][jst.getUTCDay()];
 	return `${month}/${date}(${day})`;
+}
+
+function getJstNow(now = new Date()): Date {
+	return new Date(now.getTime() + 9 * 60 * 60 * 1000);
+}
+
+function getDailyMarketTheme(jstDate: Date): {
+	label: string;
+	emoji: string;
+	sortBy: "change_desc" | "change_asc" | "spike_recent" | "price_desc";
+} {
+	const dow = jstDate.getUTCDay(); // 0=日, 1=月, ..., 6=土
+	switch (dow) {
+		case 1:
+			return { label: "価格上昇ランキング", emoji: "📈", sortBy: "change_desc" };
+		case 2:
+			return { label: "価格下落ランキング", emoji: "📉", sortBy: "change_asc" };
+		case 3:
+			return { label: "今週の急騰ランキング", emoji: "🔥", sortBy: "spike_recent" };
+		case 4:
+			return { label: "高額カードランキング", emoji: "💎", sortBy: "price_desc" };
+		case 5:
+			return { label: "価格上昇ランキング", emoji: "📈", sortBy: "change_desc" };
+		case 6:
+			return { label: "今週の急騰ランキング", emoji: "🔥", sortBy: "spike_recent" };
+		default:
+			return { label: "価格上昇ランキング", emoji: "📈", sortBy: "change_desc" };
+	}
+}
+
+function sortWatchlistByTheme(
+	list: WatchlistEntry[],
+	sortBy: "change_desc" | "change_asc" | "spike_recent" | "price_desc",
+	jstDate: Date,
+): WatchlistEntry[] {
+	const base = [...list];
+	if (sortBy === "price_desc") {
+		return base.sort((a, b) => b.currentPrice - a.currentPrice);
+	}
+	if (sortBy === "change_asc") {
+		return base.sort((a, b) => {
+			const aPct = calcPercentChange(getSummaryStartPrice(a), a.currentPrice);
+			const bPct = calcPercentChange(getSummaryStartPrice(b), b.currentPrice);
+			return aPct - bPct;
+		});
+	}
+	if (sortBy === "spike_recent") {
+		const weekMs = 1000 * 60 * 60 * 24 * 7;
+		const nowMs = new Date(jstDate.getTime()).getTime();
+		return base.sort((a, b) => {
+			const aRecent = nowMs - new Date(a.lastSeenAt).getTime() <= weekMs ? 1 : 0;
+			const bRecent = nowMs - new Date(b.lastSeenAt).getTime() <= weekMs ? 1 : 0;
+			if (aRecent !== bRecent) return bRecent - aRecent;
+			const aPct = calcPercentChange(getSummaryStartPrice(a), a.currentPrice);
+			const bPct = calcPercentChange(getSummaryStartPrice(b), b.currentPrice);
+			return bPct - aPct;
+		});
+	}
+	return base.sort((a, b) => {
+		const aPct = calcPercentChange(getSummaryStartPrice(a), a.currentPrice);
+		const bPct = calcPercentChange(getSummaryStartPrice(b), b.currentPrice);
+		return bPct - aPct;
+	});
 }
 
 function formatJstMonthDay(value: string): string {
@@ -872,12 +1005,19 @@ function signedPercentText(changePct: number): string {
 	return `${sign}${Math.abs(changePct).toFixed(1)}%`;
 }
 
-function pickChangeEmoji(changePct: number): "🔥" | "📈" | "⚡" | "✅" | "📉" {
+function getChangeEmoji(changePct: number): "🔥" | "📈" | "⚡" | "✅" | "📉" {
 	if (changePct < 0) return "📉";
 	if (changePct >= 40) return "🔥";
 	if (changePct >= 20) return "📈";
 	if (changePct >= 10) return "⚡";
 	return "✅";
+}
+
+function getRankBadge(index: number): "🥇" | "🥈" | "🥉" | "🏅" {
+	if (index === 0) return "🥇";
+	if (index === 1) return "🥈";
+	if (index === 2) return "🥉";
+	return "🏅";
 }
 
 function compactCardLabel(card: string): string {
@@ -1036,6 +1176,7 @@ async function enrichPriceSpikeIdentity(
 ): Promise<PriceSpikeItem> {
 	const base = { ...(spike ?? ({} as PriceSpikeItem)) };
 	base.image_url = undefined;
+	base.imageUrl = null;
 	const source = normalizePriceSpikeSource(base.source_site ?? payloadSource);
 	if (!source) return base;
 	if (String(base.source_site ?? "").trim() === "") {
@@ -1049,6 +1190,7 @@ async function enrichPriceSpikeIdentity(
 		const marketImage = normalizeWatchImageUrl(ogImage, source);
 		if (marketImage) {
 			base.image_url = marketImage;
+			base.imageUrl = marketImage;
 		}
 		if (source === "pokeca-chart") {
 			base.history_prices = extractPriceHistoryFromPokecaChartHtml(page.html);
@@ -1088,6 +1230,16 @@ async function fetchPriceSpikeSourcePage(
 	});
 	const html = await res.text();
 	return { html, finalUrl: res.url, status: res.status };
+}
+
+function extractCurrentPriceFromSourceHtml(html: string): number | null {
+	const text = stripTags(html).replace(/\s+/g, " ");
+	const matches = [...text.matchAll(/(?:¥|￥)\s*([0-9][0-9,]{2,})/g)];
+	const values = matches
+		.map((m) => Number(String(m[1] ?? "").replace(/,/g, "")))
+		.filter((n) => Number.isFinite(n) && n > 100);
+	if (values.length === 0) return null;
+	return values.sort((a, b) => b - a)[0];
 }
 
 function extractSourceTitle(html: string): string | null {
@@ -3426,7 +3578,7 @@ async function getWatchlistEntries(stateStore: StateStore): Promise<WatchlistEnt
 			.map((row): WatchlistEntry | null => {
 				const item = row as Partial<WatchlistEntry>;
 				const key = String(item.key ?? "").trim();
-				const card = String(item.card ?? "").trim();
+				const cardName = String((item as { cardName?: string }).cardName ?? item.card ?? "").trim();
 				const lastSeenAt = String(
 					(item as Partial<WatchlistEntry> & { lastDetectedAt?: string }).lastSeenAt ??
 						(item as { lastDetectedAt?: string }).lastDetectedAt ??
@@ -3435,7 +3587,7 @@ async function getWatchlistEntries(stateStore: StateStore): Promise<WatchlistEnt
 				const firstSeenAt = String(
 					(item as Partial<WatchlistEntry> & { firstSeenAt?: string }).firstSeenAt ?? lastSeenAt,
 				).trim();
-				if (!key || !card || !lastSeenAt || !firstSeenAt) return null;
+				if (!key || !cardName || !lastSeenAt || !firstSeenAt) return null;
 				const detectedMs = new Date(lastSeenAt).getTime();
 				if (!Number.isFinite(detectedMs)) return null;
 				if (now - detectedMs > WATCHLIST_TTL_MS) return null;
@@ -3448,14 +3600,22 @@ async function getWatchlistEntries(stateStore: StateStore): Promise<WatchlistEnt
 				}
 				if (!Number.isFinite(firstSeenPrice) || firstSeenPrice <= 0) return null;
 				const sourceSite = normalizePriceSpikeSource(item.sourceSite ?? undefined);
+				if (!sourceSite) return null;
+				const sourceUrl = String((item as { sourceUrl?: string }).sourceUrl ?? "").trim();
+				if (!sourceUrl) return null;
+				const currentPrice = Number((item as { currentPrice?: number }).currentPrice ?? afterPrice);
+				if (!Number.isFinite(currentPrice) || currentPrice <= 0) return null;
 				const priceHistory = normalizeWatchPriceHistory((item as { priceHistory?: unknown }).priceHistory);
 				return {
 					key,
-					card,
+					cardName,
+					card: cardName,
 					cardId: String(item.cardId ?? "").trim() || null,
+					sourceUrl,
 					sourceSite,
 					firstSeenAt,
 					lastSeenAt,
+					currentPrice,
 					beforePrice,
 					afterPrice,
 					changePct,
@@ -3491,23 +3651,36 @@ async function upsertWatchlistFromSpike(
 	const key = buildPriceSpikeIdentityKey(spike);
 	const nowIso = String(spike.fetched_at ?? "").trim() || new Date().toISOString();
 	const prev = current.find((item) => item.key === key) ?? null;
+	const sourceSite = normalizePriceSpikeSource(spike.source_site ?? payloadSource) ?? prev?.sourceSite;
+	if (!sourceSite) return current;
+	const sourceUrl = String(spike.source_url ?? prev?.sourceUrl ?? "").trim();
+	if (!sourceUrl) return current;
+	const cardName = getCanonicalPriceSpikeCardName(spike);
+	const startHistory =
+		prev?.priceHistory?.length && prev.priceHistory.length > 0
+			? prev.priceHistory
+			: buildInitialWatchPriceHistory(spike, nowIso);
+	const nextHistory = appendWatchPriceHistory(startHistory, nowIso, Number(spike.after));
 	const nextItem: WatchlistEntry = {
 		key,
-		card: getCanonicalPriceSpikeCardName(spike),
+		cardName,
+		card: cardName,
 		cardId: String(spike.card_id ?? "").trim() || null,
-		sourceSite: normalizePriceSpikeSource(spike.source_site ?? payloadSource),
+		sourceUrl,
+		sourceSite,
 		firstSeenAt: prev?.firstSeenAt ?? nowIso,
 		lastSeenAt: nowIso,
+		currentPrice: Number(spike.after),
 		beforePrice: Number(spike.before),
 		afterPrice: Number(spike.after),
 		changePct: Number(spike.change_pct),
 		period: normalizePriceSpikePeriod(spike.period),
-		imageUrl: normalizeWatchImageUrl(spike.image_url ?? null, normalizePriceSpikeSource(spike.source_site ?? payloadSource)),
+		imageUrl: normalizeWatchImageUrl(
+			spike.image_url ?? spike.imageUrl ?? prev?.imageUrl ?? null,
+			sourceSite,
+		),
 		firstSeenPrice: prev?.firstSeenPrice ?? Number(spike.before),
-		priceHistory:
-			prev?.priceHistory?.length && prev.priceHistory.length > 0
-				? prev.priceHistory
-				: buildInitialWatchPriceHistory(spike, nowIso),
+		priceHistory: nextHistory,
 	};
 	const merged = [nextItem, ...current.filter((item) => item.key !== key)]
 		.sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime())
@@ -3552,6 +3725,29 @@ function normalizeWatchPriceHistory(value: unknown): Array<{ date: string; price
 			return { date, price };
 		})
 		.filter((item): item is { date: string; price: number } => Boolean(item))
+		.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+		.slice(-30);
+}
+
+function appendWatchPriceHistory(
+	current: Array<{ date: string; price: number }>,
+	isoDateTime: string,
+	price: number,
+): Array<{ date: string; price: number }> {
+	const base = normalizeWatchPriceHistory(current);
+	if (!Number.isFinite(price) || price <= 0) return base;
+	const dateKey = new Date(isoDateTime);
+	const day = Number.isFinite(dateKey.getTime())
+		? dateKey.toISOString().slice(0, 10)
+		: new Date().toISOString().slice(0, 10);
+	const next = [...base];
+	const idx = next.findIndex((row) => row.date === day);
+	if (idx >= 0) {
+		next[idx] = { date: day, price };
+	} else {
+		next.push({ date: day, price });
+	}
+	return next
 		.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
 		.slice(-30);
 }
