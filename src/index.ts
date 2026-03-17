@@ -55,6 +55,18 @@ type PriceSpikePayload = {
 	spikes: PriceSpikeItem[];
 };
 
+type WatchlistEntry = {
+	key: string;
+	card: string;
+	cardId: string | null;
+	sourceSite: "snkrdunk" | "pokeca-chart" | null;
+	lastDetectedAt: string;
+	beforePrice: number;
+	afterPrice: number;
+	changePct: number;
+	period: string;
+};
+
 type RankProbability = {
 	rank: number;
 	totalSupply: number;
@@ -133,6 +145,16 @@ const DAILY_LAST_SOURCE_KEY = "last_daily_source";
 const LATEST_MARKET_CONTEXT_KEY = "latest_market_context";
 const DAILY_RECENT_HISTORY_LIMIT = 10;
 const ALERT_MARKET_CHANGE_PCT_MIN = 8;
+const ALERT_THRESHOLDS: Record<MonitorSource, { low: number; high: number }> = {
+	mercari: { low: 10, high: 5 },
+	tcgstore: { low: 5, high: 1 },
+};
+const WATCHLIST_KEY = "watchlist";
+const WATCHLIST_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+const WATCHLIST_LIMIT = 20;
+const ENABLE_TCG_DAILY_SPOTLIGHT = false;
+const ENABLE_MERCARI_DAILY_SPOTLIGHT = false;
+const ENABLE_MARKET_SUMMARY_DAILY = true;
 const DAILY_AI_PATTERN_ORDER: DailyAiPattern[] = [
 	"market_analysis",
 	"contrarian",
@@ -192,6 +214,12 @@ const PRICE_SPIKE_SYSTEM_PROMPT = `あなたはポケカ好きな情報通。市
 - 温度はあるが煽らない
 - 断定予測はしない`;
 
+const MARKET_SUMMARY_SYSTEM_PROMPT = `あなたはポケカ市場情報を簡潔に共有する編集者です。
+- 数字は入力データと一致させる
+- 断定予測・煽りは禁止
+- 具体的な上昇/下落を短文で示す
+- URLは含めない`;
+
 const MERCARI_DAILY_AI_SYSTEM_PROMPT = `あなたはTCGSTOREのX運用担当。
 メルカリくじの紹介投稿を作るが、広告っぽさよりも「読む価値」を優先する。
 - 派手な絵文字連打は禁止
@@ -212,6 +240,9 @@ export default {
 			return jsonResponse(result);
 		}
 		if (mode === "tcg_daily") {
+			if (!ENABLE_TCG_DAILY_SPOTLIGHT) {
+				return jsonResponse({ ok: false, reason: "tcg_daily_disabled" });
+			}
 			const commit = reqUrl.searchParams.get("commit") === "1";
 			const excludeUnits = (reqUrl.searchParams.get("exclude_unit") ?? "")
 				.split(",")
@@ -239,6 +270,9 @@ export default {
 			return jsonResponse(result);
 		}
 		if (mode === "mercari_daily") {
+			if (!ENABLE_MERCARI_DAILY_SPOTLIGHT) {
+				return jsonResponse({ ok: false, reason: "mercari_daily_disabled" });
+			}
 			const commit = reqUrl.searchParams.get("commit") === "1";
 			const pickOffsetRaw = Number(reqUrl.searchParams.get("pick_offset") ?? "0");
 			const pickOffset = Number.isFinite(pickOffsetRaw) ? Math.trunc(pickOffsetRaw) : 0;
@@ -253,6 +287,15 @@ export default {
 		if (mode === "price_spike") {
 			const commit = reqUrl.searchParams.get("commit") === "1";
 			const result = await runPriceSpikeMode(request, env, { commit, logToConsole: true });
+			return jsonResponse(result);
+		}
+		if (mode === "market_summary") {
+			const commit = reqUrl.searchParams.get("commit") === "1";
+			const result = await runDailyMarketSummaryPost(env, {
+				commit,
+				logToConsole: true,
+				fromSchedule: false,
+			});
 			return jsonResponse(result);
 		}
 
@@ -273,8 +316,8 @@ export default {
 			forceCommit: true,
 			logToConsole: true,
 		});
-		if (isDailySpotlightCron(event)) {
-			await runDailyRandomSpotlight(env, {
+		if (isMarketSummaryCron(event) && ENABLE_MARKET_SUMMARY_DAILY) {
+			await runDailyMarketSummaryPost(env, {
 				commit: true,
 				logToConsole: true,
 				fromSchedule: true,
@@ -447,6 +490,10 @@ function isDailySpotlightCron(event: ScheduledEvent): boolean {
 	return event.cron === "0 3 * * *" || event.cron === "0 12 * * *";
 }
 
+function isMarketSummaryCron(event: ScheduledEvent): boolean {
+	return event.cron === "0 12 * * *";
+}
+
 async function runDailyRandomSpotlight(
 	env: MonitorEnv,
 	options: { commit?: boolean; logToConsole?: boolean; fromSchedule?: boolean } = {},
@@ -532,6 +579,7 @@ async function runPriceSpikeMode(
 			};
 		}
 		const stateStore = createStateStore(env);
+		const watchlist = await upsertWatchlistFromSpike(stateStore, spike, payload?.source);
 		await stateStore.put(
 			LATEST_MARKET_CONTEXT_KEY,
 			JSON.stringify({
@@ -591,6 +639,7 @@ async function runPriceSpikeMode(
 			postedToX,
 			previewMessage,
 			skipped: false,
+			watchlistCount: watchlist.length,
 			xResponse,
 		};
 		if (logToConsole) console.log(JSON.stringify({ type: "PRICE_SPIKE_RESULT", ...result }, null, 2));
@@ -605,6 +654,160 @@ async function runPriceSpikeMode(
 			previewMessage: "",
 		};
 	}
+}
+
+async function runDailyMarketSummaryPost(
+	env: MonitorEnv,
+	options: { commit?: boolean; logToConsole?: boolean; fromSchedule?: boolean } = {},
+): Promise<Record<string, unknown>> {
+	const { commit = false, logToConsole = true, fromSchedule = false } = options;
+	const stateStore = createStateStore(env);
+	const watchlist = await pruneAndPersistWatchlist(stateStore);
+	if (watchlist.length === 0) {
+		const result = { ok: false, reason: "watchlist_empty", committed: false, postedToX: false, fromSchedule };
+		if (logToConsole) console.log(JSON.stringify({ type: "MARKET_SUMMARY_SKIP", ...result }, null, 2));
+		return result;
+	}
+	const sorted = [...watchlist].sort((a, b) => {
+		const diffChange = Math.abs(b.changePct) - Math.abs(a.changePct);
+		if (diffChange !== 0) return diffChange;
+		return new Date(b.lastDetectedAt).getTime() - new Date(a.lastDetectedAt).getTime();
+	});
+	const picked = sorted.slice(0, 5);
+	if (picked.length < 3) {
+		const result = {
+			ok: false,
+			reason: "watchlist_not_enough_items",
+			watchlistCount: watchlist.length,
+			committed: false,
+			postedToX: false,
+			fromSchedule,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "MARKET_SUMMARY_SKIP", ...result }, null, 2));
+		return result;
+	}
+	const ai = await generateMarketSummaryMessage(picked, env);
+	const message = ai.ok && ai.message ? ai.message : buildMarketSummaryFallbackMessage(picked);
+
+	let postedToX = false;
+	let committed = false;
+	let xResponse: unknown = null;
+	if (commit) {
+		const postResult = await postTweetWithImages(
+			message,
+			{ mainImageUrl: null, lastOneImageUrl: null },
+			env,
+		);
+		postedToX = postResult.ok;
+		xResponse = postResult;
+		committed = postResult.ok;
+	}
+	const result = {
+		ok: true,
+		fromSchedule,
+		commitMode: commit,
+		committed,
+		postedToX,
+		aiUsed: ai.ok,
+		aiReason: ai.reason ?? null,
+		watchlistCount: watchlist.length,
+		pickedCount: picked.length,
+		picked,
+		previewMessage: message,
+		xResponse,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "MARKET_SUMMARY_RESULT", ...result }, null, 2));
+	return result;
+}
+
+async function generateMarketSummaryMessage(
+	picked: WatchlistEntry[],
+	env: MonitorEnv,
+): Promise<{ ok: boolean; message?: string; reason?: string }> {
+	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
+	const model = env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+	const jstLabel = getJstMarketSummaryLabel();
+	const lines = picked.map((item, idx) => {
+		const delta = item.afterPrice - item.beforePrice;
+		const sign = delta >= 0 ? "+" : "-";
+		return `${idx + 1}. ${item.card} | ${formatNumber(item.beforePrice)}円 -> ${formatNumber(item.afterPrice)}円 | ${sign}${formatNumber(Math.abs(delta))}円 | ${Number(item.changePct).toFixed(2)}% | ${item.period}`;
+	});
+	const prompt = [
+		"以下の監視銘柄データを元に、X投稿文を1本作成してください。",
+		`日付ラベル: ${jstLabel}`,
+		"",
+		"【監視銘柄】",
+		...lines,
+		"",
+		"## 投稿スタイル",
+		"- 1行目：【3/16(月)ポケカ相場】のように日付＋テーマ",
+		"- 箇条書き3〜5件（✅や📈📉で区切る）",
+		"- 数字は必ず具体的に（「14,500円まで上昇」「先週比+2,099円」）",
+		"- 上昇・下落の方向感を明示する",
+		"- 1項目1〜2行、短く切る",
+		"- ハッシュタグは #ポケカ 1つのみ",
+		"- URL含めない（市場情報のみ）",
+		"- 煽り・断定・予測禁止",
+	].join("\n");
+	const response = await callAnthropicTextGeneration({
+		system: MARKET_SUMMARY_SYSTEM_PROMPT,
+		prompt,
+		apiKey: env.ANTHROPIC_API_KEY,
+		model,
+	});
+	if (!response.ok || !response.text) return { ok: false, reason: response.reason ?? "anthropic_failed" };
+	const normalized = normalizeMarketSummaryMessage(response.text);
+	const validation = validateMarketSummaryMessage(normalized);
+	if (!validation.ok) return { ok: false, reason: validation.reasons.join(" / ") };
+	return { ok: true, message: normalized };
+}
+
+function normalizeMarketSummaryMessage(text: string): string {
+	const withoutFence = text.replace(/```[\s\S]*?```/g, " ").trim();
+	const noUrl = withoutFence.replace(/https?:\/\/\S+/g, "").trim();
+	const rows = noUrl
+		.split(/\n+/)
+		.map((line) => line.replace(/#[\p{L}\p{N}_]+/gu, "").replace(/\s+/g, " ").trim())
+		.filter(Boolean);
+	const withTag = [...rows, "#ポケカ"];
+	return withTag.join("\n").trim();
+}
+
+function validateMarketSummaryMessage(text: string): { ok: boolean; reasons: string[] } {
+	const reasons: string[] = [];
+	if (/https?:\/\/\S+/.test(text)) reasons.push("URLは禁止です");
+	const tags = extractHashtags(text);
+	if (tags.length !== 1 || tags[0] !== "#ポケカ") reasons.push("ハッシュタグは #ポケカ のみ");
+	const rows = text.split("\n").map((line) => line.trim()).filter(Boolean);
+	if (!/^【\d{1,2}\/\d{1,2}\(.+\)ポケカ相場】$/.test(rows[0] ?? "")) {
+		reasons.push("1行目の日付テーマ形式が不正です");
+	}
+	const bulletCount = rows.filter((line) => /^[✅📈📉]/.test(line)).length;
+	if (bulletCount < 3 || bulletCount > 5) reasons.push("箇条書きは3〜5件にしてください");
+	if (/急げ|爆アツ|絶対|確実|買うべき|まだ上がる/.test(text)) reasons.push("煽り/断定表現を検出");
+	if (!/[0-9][0-9,]*円/.test(text)) reasons.push("価格の具体数値が不足しています");
+	return { ok: reasons.length === 0, reasons };
+}
+
+function buildMarketSummaryFallbackMessage(picked: WatchlistEntry[]): string {
+	const label = getJstMarketSummaryLabel();
+	const bullets = picked.slice(0, 3).map((item) => {
+		const delta = item.afterPrice - item.beforePrice;
+		const isUp = delta >= 0;
+		const icon = isUp ? "📈" : "📉";
+		const key = extractTrendKeyword(item.card) || item.card;
+		const deltaText = `${isUp ? "+" : "-"}${formatNumber(Math.abs(delta))}円`;
+		return `${icon}${key} ${formatNumber(item.afterPrice)}円（直近比${deltaText}）`;
+	});
+	return [`【${label}ポケカ相場】`, "", ...bullets, "", "#ポケカ"].join("\n");
+}
+
+function getJstMarketSummaryLabel(now = new Date()): string {
+	const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+	const month = jst.getUTCMonth() + 1;
+	const date = jst.getUTCDate();
+	const day = ["日", "月", "火", "水", "木", "金", "土"][jst.getUTCDay()];
+	return `${month}/${date}(${day})`;
 }
 
 async function generatePriceSpikeMessage(
@@ -2003,8 +2206,9 @@ async function runMonitor(
 
 		const shouldForceUnder1 = activeForceLevel === "under_1";
 		const shouldForceUnder5 = activeForceLevel === "under_5";
+		const thresholds = ALERT_THRESHOLDS[item.source];
 
-		if ((detail.percent <= 1 || shouldForceUnder1) && !under1Posted) {
+		if ((detail.percent <= thresholds.high || shouldForceUnder1) && !under1Posted) {
 			action = "notify_under_1";
 			previewMessage = buildAlertMessage({
 				source: item.source,
@@ -2035,7 +2239,7 @@ async function runMonitor(
 					committed = true;
 				}
 			}
-		} else if ((detail.percent <= 5 || shouldForceUnder5) && !under5Posted) {
+		} else if ((detail.percent <= thresholds.low || shouldForceUnder5) && !under5Posted) {
 			action = "notify_under_5";
 			previewMessage = buildAlertMessage({
 				source: item.source,
@@ -3093,6 +3297,81 @@ async function appendRecentUrlHistory(stateStore: StateStore, key: string, url: 
 	const current = await getRecentUrlHistory(stateStore, key);
 	const next = [normalized, ...current.filter((item) => item !== normalized)].slice(0, DAILY_RECENT_HISTORY_LIMIT);
 	await stateStore.put(key, JSON.stringify(next));
+}
+
+async function getWatchlistEntries(stateStore: StateStore): Promise<WatchlistEntry[]> {
+	const raw = await stateStore.get(WATCHLIST_KEY);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!Array.isArray(parsed)) return [];
+		const now = Date.now();
+		return parsed
+			.map((row): WatchlistEntry | null => {
+				const item = row as Partial<WatchlistEntry>;
+				const key = String(item.key ?? "").trim();
+				const card = String(item.card ?? "").trim();
+				const lastDetectedAt = String(item.lastDetectedAt ?? "").trim();
+				if (!key || !card || !lastDetectedAt) return null;
+				const detectedMs = new Date(lastDetectedAt).getTime();
+				if (!Number.isFinite(detectedMs)) return null;
+				if (now - detectedMs > WATCHLIST_TTL_MS) return null;
+				const beforePrice = Number(item.beforePrice ?? NaN);
+				const afterPrice = Number(item.afterPrice ?? NaN);
+				const changePct = Number(item.changePct ?? NaN);
+				if (!Number.isFinite(beforePrice) || !Number.isFinite(afterPrice) || !Number.isFinite(changePct)) {
+					return null;
+				}
+				const sourceSite = normalizePriceSpikeSource(item.sourceSite ?? undefined);
+				return {
+					key,
+					card,
+					cardId: String(item.cardId ?? "").trim() || null,
+					sourceSite,
+					lastDetectedAt,
+					beforePrice,
+					afterPrice,
+					changePct,
+					period: normalizePriceSpikePeriod(item.period),
+				};
+			})
+			.filter((item): item is WatchlistEntry => Boolean(item))
+			.sort((a, b) => new Date(b.lastDetectedAt).getTime() - new Date(a.lastDetectedAt).getTime())
+			.slice(0, WATCHLIST_LIMIT);
+	} catch {
+		return [];
+	}
+}
+
+async function pruneAndPersistWatchlist(stateStore: StateStore): Promise<WatchlistEntry[]> {
+	const list = await getWatchlistEntries(stateStore);
+	await stateStore.put(WATCHLIST_KEY, JSON.stringify(list));
+	return list;
+}
+
+async function upsertWatchlistFromSpike(
+	stateStore: StateStore,
+	spike: PriceSpikeItem,
+	payloadSource: string | undefined,
+): Promise<WatchlistEntry[]> {
+	const current = await getWatchlistEntries(stateStore);
+	const key = buildPriceSpikeIdentityKey(spike);
+	const nextItem: WatchlistEntry = {
+		key,
+		card: getCanonicalPriceSpikeCardName(spike),
+		cardId: String(spike.card_id ?? "").trim() || null,
+		sourceSite: normalizePriceSpikeSource(spike.source_site ?? payloadSource),
+		lastDetectedAt: String(spike.fetched_at ?? "").trim() || new Date().toISOString(),
+		beforePrice: Number(spike.before),
+		afterPrice: Number(spike.after),
+		changePct: Number(spike.change_pct),
+		period: normalizePriceSpikePeriod(spike.period),
+	};
+	const merged = [nextItem, ...current.filter((item) => item.key !== key)]
+		.sort((a, b) => new Date(b.lastDetectedAt).getTime() - new Date(a.lastDetectedAt).getTime())
+		.slice(0, WATCHLIST_LIMIT);
+	await stateStore.put(WATCHLIST_KEY, JSON.stringify(merged));
+	return merged;
 }
 
 async function getLatestMarketContext(
