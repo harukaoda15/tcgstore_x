@@ -694,7 +694,7 @@ async function runDailyMarketSummaryPost(
 		if (diffChange !== 0) return diffChange;
 		return new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime();
 	});
-	const picked = sorted.slice(0, 5);
+	const picked = sorted.slice(0, 3);
 	if (picked.length < 3) {
 		const result = {
 			ok: false,
@@ -1035,6 +1035,7 @@ async function enrichPriceSpikeIdentity(
 	payloadSource: string | undefined,
 ): Promise<PriceSpikeItem> {
 	const base = { ...(spike ?? ({} as PriceSpikeItem)) };
+	base.image_url = undefined;
 	const source = normalizePriceSpikeSource(base.source_site ?? payloadSource);
 	if (!source) return base;
 	if (String(base.source_site ?? "").trim() === "") {
@@ -1045,8 +1046,9 @@ async function enrichPriceSpikeIdentity(
 		const page = await fetchPriceSpikeSourcePage(base.source_url!);
 		const pageOrigin = new URL(page.finalUrl || base.source_url!).origin;
 		const ogImage = extractOgImageUrl(page.html, pageOrigin);
-		if (ogImage) {
-			base.image_url = ogImage;
+		const marketImage = normalizeWatchImageUrl(ogImage, source);
+		if (marketImage) {
+			base.image_url = marketImage;
 		}
 		if (source === "pokeca-chart") {
 			base.history_prices = extractPriceHistoryFromPokecaChartHtml(page.html);
@@ -3458,7 +3460,10 @@ async function getWatchlistEntries(stateStore: StateStore): Promise<WatchlistEnt
 					afterPrice,
 					changePct,
 					period: normalizePriceSpikePeriod(item.period),
-					imageUrl: normalizeWatchImageUrl((item as { imageUrl?: string }).imageUrl ?? null),
+					imageUrl: normalizeWatchImageUrl(
+						(item as { imageUrl?: string }).imageUrl ?? null,
+						sourceSite,
+					),
 					firstSeenPrice,
 					priceHistory,
 				};
@@ -3497,7 +3502,7 @@ async function upsertWatchlistFromSpike(
 		afterPrice: Number(spike.after),
 		changePct: Number(spike.change_pct),
 		period: normalizePriceSpikePeriod(spike.period),
-		imageUrl: normalizeWatchImageUrl(spike.image_url ?? prev?.imageUrl ?? null),
+		imageUrl: normalizeWatchImageUrl(spike.image_url ?? null, normalizePriceSpikeSource(spike.source_site ?? payloadSource)),
 		firstSeenPrice: prev?.firstSeenPrice ?? Number(spike.before),
 		priceHistory:
 			prev?.priceHistory?.length && prev.priceHistory.length > 0
@@ -3511,10 +3516,27 @@ async function upsertWatchlistFromSpike(
 	return merged;
 }
 
-function normalizeWatchImageUrl(url: string | null | undefined): string | null {
+function normalizeWatchImageUrl(
+	url: string | null | undefined,
+	source?: "snkrdunk" | "pokeca-chart" | null,
+): string | null {
 	const value = String(url ?? "").trim();
 	if (!value) return null;
 	if (!/^https?:\/\//i.test(value)) return null;
+	try {
+		const parsed = new URL(value);
+		const host = parsed.hostname.toLowerCase();
+		if (source === "snkrdunk") {
+			if (!(host === "snkrdunk.com" || host.endsWith(".snkrdunk.com"))) return null;
+		}
+		if (source === "pokeca-chart") {
+			if (!(host === "pokeca-chart.com" || host.endsWith(".pokeca-chart.com"))) return null;
+		}
+		const lower = value.toLowerCase();
+		if (/og-image|header\.png|logo|favicon|icon|default|opengraph/.test(lower)) return null;
+	} catch {
+		return null;
+	}
 	return value;
 }
 
@@ -3539,12 +3561,13 @@ function buildInitialWatchPriceHistory(
 	fallbackIso: string,
 ): Array<{ date: string; price: number }> {
 	const fetchedAt = new Date(String(spike.fetched_at ?? fallbackIso));
-	const fallbackDate = Number.isFinite(fetchedAt.getTime())
-		? fetchedAt.toISOString().slice(0, 10)
+	const rangeDays = estimateRangeDaysFromPeriod(spike.period);
+	const fallbackStartDate = Number.isFinite(fetchedAt.getTime())
+		? new Date(fetchedAt.getTime() - rangeDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
 		: new Date().toISOString().slice(0, 10);
 	const sourceHistory = normalizeWatchPriceHistory(spike.history_prices ?? []);
 	if (sourceHistory.length === 0) {
-		return [{ date: fallbackDate, price: Number(spike.before) }];
+		return [{ date: fallbackStartDate, price: Number(spike.before) }];
 	}
 	const pickByDays = (daysAgo: number): { date: string; price: number } | null => {
 		const target = new Date(fetchedAt.getTime() - daysAgo * 24 * 60 * 60 * 1000);
@@ -3567,6 +3590,11 @@ function buildInitialWatchPriceHistory(
 function getSummaryRangeStartDate(entry: WatchlistEntry): string {
 	const history = normalizeWatchPriceHistory(entry.priceHistory);
 	if (history.length > 0) return `${history[0].date}T00:00:00.000Z`;
+	const fallbackDays = estimateRangeDaysFromPeriod(entry.period);
+	const lastSeen = new Date(entry.lastSeenAt);
+	if (Number.isFinite(lastSeen.getTime())) {
+		return new Date(lastSeen.getTime() - fallbackDays * 24 * 60 * 60 * 1000).toISOString();
+	}
 	return entry.firstSeenAt;
 }
 
@@ -3580,6 +3608,16 @@ function getSummaryStartPrice(entry: WatchlistEntry): number {
 function calcPercentChange(before: number, after: number): number {
 	if (!Number.isFinite(before) || before <= 0 || !Number.isFinite(after)) return 0;
 	return ((after - before) / before) * 100;
+}
+
+function estimateRangeDaysFromPeriod(period?: string): number {
+	const value = String(period ?? "").trim();
+	if (/1\s*(?:か月|ヶ月|月)/.test(value)) return 30;
+	if (/30\s*日/.test(value)) return 30;
+	if (/1\s*週間/.test(value)) return 7;
+	if (/7\s*日/.test(value)) return 7;
+	if (/2\s*週間|14\s*日/.test(value)) return 14;
+	return 7;
 }
 
 async function getLatestMarketContext(

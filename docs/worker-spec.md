@@ -62,17 +62,21 @@
 - データ元: KV `watchlist`（price_spikeで自動更新）
 - watchlist運用:
   - 価格スパイク検出時にカードを自動追加
-  - 既存カードは `lastDetectedAt` を更新
+  - 既存カードは `lastSeenAt` を更新（初回は `firstSeenAt` を保持）
   - 最後の検出から7日経過したカードは自動除外
   - 上限20件（新しい順）
+  - `source_url` から `og:image` を抽出し `imageUrl` として保存
 - 投稿スタイル:
   - 1行目: `【M/D(曜)ポケカ相場】`
-  - 本文: 3〜5件、`✅` `📈` `📉` で区切って具体数値を記載
+  - 本文: 3〜5件、カード間に空行を入れて読みやすくする
+  - 絵文字は上昇率ルールで固定（`🔥 / 📈 / ⚡ / ✅ / 📉`）
+  - 価格行は `前回→現在（3/10→3/17 +49.0%）` 形式
   - 上昇/下落方向を明示
   - 1項目は1〜2行
   - URLなし
   - ハッシュタグは `#ポケカ` 1つのみ
   - 煽り・断定・予測は禁止
+  - 画像は watchlist の `imageUrl` から最大3枚添付
 
 ## 機能3: TCG STORE daily 紹介（AI）【停止中】
 
@@ -252,7 +256,8 @@
   - `source: string`
   - `spikes: [{ card, variant?, card_id?, before, after, change_pct, fetched_at, period?, source_site?, source_url? }]`
 - `spikes` の先頭1件のみ処理
-- 成功時は KV `watchlist` を更新（新規追加 / 最終検出時刻更新 / 7日失効データを除外）
+- 成功時は KV `watchlist` を更新（新規追加 / `firstSeenAt`・`lastSeenAt` 更新 / 7日失効データを除外）
+- `source_url` ページから `og:image` を抽出し、`watchlist.imageUrl` に保存
 - 入力バリデーション（厳格）:
   - 参照サイトは `snkrdunk` / `pokeca-chart` のみ許可
   - `source_url` は必須（対応サイトのURLのみ許可）
