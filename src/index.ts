@@ -370,6 +370,16 @@ export default {
 			return jsonResponse(result);
 		}
 
+		if (mode === "price_ranking") {
+			const commit = reqUrl.searchParams.get("commit") === "1";
+			const result = await runPriceRanking(env, {
+				commit,
+				logToConsole: true,
+				fromSchedule: false,
+			});
+			return jsonResponse(result);
+		}
+
 		if (reqUrl.pathname === "/approve") {
 			const token = reqUrl.searchParams.get("token");
 			const key = reqUrl.searchParams.get("key");
@@ -453,12 +463,12 @@ export default {
 		if (event.cron === "0 11 * * *") {
 			await refreshWatchlistPrices(env, { logToConsole: true });
 		}
-		if (isMarketSummaryCron(event) && ENABLE_MARKET_SUMMARY_DAILY) {
-			await runMarketSummary(env, {
-				commit: true,
-				logToConsole: true,
-				fromSchedule: true,
-			});
+		if (event.cron === "0 12 * * *") {
+			if (ENABLE_PRICE_RANKING_DAILY) {
+				await runPriceRanking(env, { commit: true, logToConsole: true, fromSchedule: true });
+			} else if (ENABLE_MARKET_SUMMARY_DAILY) {
+				await runMarketSummary(env, { commit: true, logToConsole: true, fromSchedule: true });
+			}
 		}
 	},
 };
@@ -4235,6 +4245,276 @@ async function postQuoteTweet(
 	let data: unknown = null;
 	try { data = JSON.parse(raw); } catch { data = { raw }; }
 	return { ok: res.ok, status: res.status, data };
+}
+
+function getPriceAtDaysAgo(
+	entry: WatchlistEntry,
+	days: number,
+	refDate: Date,
+): { price: number; date: string } | null {
+	const history = normalizeWatchPriceHistory(entry.priceHistory);
+	if (history.length === 0) return null;
+	const targetMs = refDate.getTime() - days * 24 * 60 * 60 * 1000;
+	let best: { row: { date: string; price: number }; diff: number } | null = null;
+	for (const row of history) {
+		const t = new Date(`${row.date}T00:00:00Z`).getTime();
+		if (!Number.isFinite(t)) continue;
+		const diff = Math.abs(t - targetMs);
+		if (!best || diff < best.diff) best = { row, diff };
+	}
+	if (!best) return null;
+	// Require the closest data point to be within 5 days of the target
+	if (best.diff > 5 * 24 * 60 * 60 * 1000) return null;
+	return { price: best.row.price, date: best.row.date };
+}
+
+type RankingThemeType = "7d_rise" | "7d_fall" | "30d_rise_amount" | "pikachu_7d_rise";
+
+type RankingTheme = {
+	type: RankingThemeType;
+	label: string;
+	days: number;
+	characterFilter: string | null;
+};
+
+function getDailyRankingTheme(jstDate: Date): RankingTheme {
+	const dow = jstDate.getUTCDay(); // 0=Sun, 1=Mon, ..., 6=Sat
+	switch (dow) {
+		case 1: // Mon
+		case 5: // Fri
+			return { type: "7d_rise", label: "7日値上がり率ランキング", days: 7, characterFilter: null };
+		case 2: // Tue
+		case 6: // Sat
+			return { type: "7d_fall", label: "7日値下がり率ランキング", days: 7, characterFilter: null };
+		case 3: // Wed
+		case 0: // Sun
+			return { type: "30d_rise_amount", label: "30日値上がり額ランキング", days: 30, characterFilter: null };
+		case 4: // Thu
+			return { type: "pikachu_7d_rise", label: "ピカチュウ関連7日値上がり率ランキング", days: 7, characterFilter: "pikachu" };
+		default:
+			return { type: "7d_rise", label: "7日値上がり率ランキング", days: 7, characterFilter: null };
+	}
+}
+
+function filterWatchlistByCharacter(
+	list: WatchlistEntry[],
+	characterKey: string,
+): WatchlistEntry[] {
+	const filter = CHARACTER_FILTERS[characterKey];
+	if (!filter) return list;
+	return list.filter((entry) => {
+		const name = String(entry.cardName ?? entry.card ?? "");
+		if (filter.cardIds.length > 0 && entry.cardId && filter.cardIds.includes(entry.cardId)) {
+			return true;
+		}
+		return filter.keywords.some((kw) =>
+			name.includes(kw),
+		);
+	});
+}
+
+type RankingEntry = {
+	entry: WatchlistEntry;
+	pastPrice: number;
+	pastDate: string;
+	currentPrice: number;
+	currentDate: string;
+	changePct: number;
+	changeAmount: number;
+};
+
+function buildRankingEntries(
+	watchlist: WatchlistEntry[],
+	theme: RankingTheme,
+	jstDate: Date,
+): RankingEntry[] {
+	const currentDateStr = jstDate.toISOString().slice(0, 10);
+	const entries: RankingEntry[] = [];
+	for (const entry of watchlist) {
+		const past = getPriceAtDaysAgo(entry, theme.days, jstDate);
+		if (!past) continue;
+		const currentPrice = entry.currentPrice;
+		if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+		if (!Number.isFinite(past.price) || past.price <= 0) continue;
+		// Skip if prices are identical (no movement)
+		if (past.price === currentPrice) continue;
+		const changePct = calcPercentChange(past.price, currentPrice);
+		const changeAmount = currentPrice - past.price;
+		entries.push({
+			entry,
+			pastPrice: past.price,
+			pastDate: past.date,
+			currentPrice,
+			currentDate: currentDateStr,
+			changePct,
+			changeAmount,
+		});
+	}
+	return entries;
+}
+
+function sortRankingEntries(entries: RankingEntry[], theme: RankingTheme): RankingEntry[] {
+	const sorted = [...entries];
+	if (theme.type === "7d_fall") {
+		sorted.sort((a, b) => a.changePct - b.changePct);
+	} else if (theme.type === "30d_rise_amount") {
+		sorted.sort((a, b) => b.changeAmount - a.changeAmount);
+	} else {
+		sorted.sort((a, b) => b.changePct - a.changePct);
+	}
+	return sorted;
+}
+
+function buildPriceRankingMessage(
+	ranked: RankingEntry[],
+	theme: RankingTheme,
+	jstDate: Date,
+): string {
+	const RANK_EMOJIS = ["🔥", "📈", "⚡"] as const;
+	const month = jstDate.getUTCMonth() + 1;
+	const day = jstDate.getUTCDate();
+	const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"] as const;
+	const dow = jstDate.getUTCDay();
+	const dateLabel = `${month}/${day}(${WEEKDAY_LABELS[dow]})`;
+
+	const lines: string[] = [
+		`【${dateLabel}ポケカ相場】`,
+		theme.label,
+	];
+
+	const top3 = ranked.slice(0, 3);
+	for (let i = 0; i < top3.length; i++) {
+		const { pastPrice, pastDate, currentPrice, currentDate, changePct, changeAmount } = top3[i];
+		const emoji = RANK_EMOJIS[i] ?? "🏅";
+		const cardName = compactCardLabel(top3[i].entry.cardName || top3[i].entry.card);
+
+		// Format dates as M/D
+		const fmtDate = (dateStr: string): string => {
+			const d = new Date(`${dateStr}T00:00:00Z`);
+			if (!Number.isFinite(d.getTime())) return dateStr;
+			return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
+		};
+
+		let changeStr: string;
+		if (theme.type === "30d_rise_amount") {
+			const sign = changeAmount >= 0 ? "+" : "-";
+			changeStr = `${sign}${formatNumber(Math.abs(changeAmount))}円`;
+		} else {
+			const sign = changePct >= 0 ? "+" : "";
+			changeStr = `${sign}${changePct.toFixed(1)}%`;
+		}
+
+		const periodStr = `${fmtDate(pastDate)}→${fmtDate(currentDate)}`;
+		const priceStr = `${formatNumber(pastPrice)}円→${formatNumber(currentPrice)}円`;
+
+		lines.push("");
+		lines.push(`${emoji} ${cardName}`);
+		lines.push(`${priceStr}（${periodStr} ${changeStr}）`);
+	}
+
+	lines.push("");
+	lines.push("#ポケカ");
+
+	return lines.join("\n");
+}
+
+async function runPriceRanking(
+	env: MonitorEnv,
+	options: { commit?: boolean; logToConsole?: boolean; fromSchedule?: boolean } = {},
+): Promise<Record<string, unknown>> {
+	const { commit = false, logToConsole = true, fromSchedule = false } = options;
+	const stateStore = createStateStore(env);
+	const watchlist = await pruneAndPersistWatchlist(stateStore);
+	if (watchlist.length === 0) {
+		const result = { ok: false, reason: "watchlist_empty", committed: false, postedToX: false, fromSchedule };
+		if (logToConsole) console.log(JSON.stringify({ type: "PRICE_RANKING_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const jstNow = getJstNow();
+	const theme = getDailyRankingTheme(jstNow);
+
+	// Apply character filter if theme requires
+	const filteredWatchlist = theme.characterFilter
+		? filterWatchlistByCharacter(watchlist, theme.characterFilter)
+		: watchlist;
+
+	if (filteredWatchlist.length === 0) {
+		const result = { ok: false, reason: "no_cards_after_filter", theme, fromSchedule, committed: false, postedToX: false };
+		if (logToConsole) console.log(JSON.stringify({ type: "PRICE_RANKING_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const rankingEntries = buildRankingEntries(filteredWatchlist, theme, jstNow);
+	const sorted = sortRankingEntries(rankingEntries, theme);
+	const top3 = sorted.slice(0, 3);
+
+	if (top3.length < 3) {
+		const result = {
+			ok: false,
+			reason: "not_enough_ranking_entries",
+			theme,
+			entryCount: rankingEntries.length,
+			fromSchedule,
+			committed: false,
+			postedToX: false,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "PRICE_RANKING_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const message = buildPriceRankingMessage(top3, theme, jstNow);
+
+	let postedToX = false;
+	let committed = false;
+	let xResponse: unknown = null;
+	let pendingKey: string | undefined;
+	let telegramNotified = false;
+
+	if (commit) {
+		if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE) {
+			const key = `pending_post:${crypto.randomUUID()}`;
+			const pending: PendingPost = {
+				message,
+				mainImageUrl: null,
+				lastOneImageUrl: null,
+				source: "price_ranking",
+				createdAt: new Date().toISOString(),
+			};
+			await env.STATE.put(key, JSON.stringify(pending), { expirationTtl: PENDING_POST_TTL_SECONDS });
+			const approveUrl = `https://tcgstore-x.harukaoda15.workers.dev/approve?key=${key}&token=${env.APPROVE_SECRET_TOKEN}`;
+			await sendTelegram(
+				`📊 相場ランキングプレビュー\n\n${message}\n\n---\n✅ 承認する場合はこちら:\n${approveUrl}\n\n⏰ 2時間以内に承認してください`,
+				env,
+			);
+			pendingKey = key;
+			telegramNotified = true;
+		} else {
+			const postResult = await postTweetWithImages(message, { mainImageUrl: null, lastOneImageUrl: null }, env);
+			postedToX = postResult.ok;
+			xResponse = postResult;
+			committed = postResult.ok;
+		}
+	}
+
+	const result = {
+		ok: true,
+		fromSchedule,
+		commitMode: commit,
+		committed,
+		postedToX,
+		theme,
+		watchlistCount: watchlist.length,
+		filteredCount: filteredWatchlist.length,
+		rankingCount: rankingEntries.length,
+		top3Count: top3.length,
+		previewMessage: message,
+		pendingKey,
+		telegramNotified,
+		xResponse,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "PRICE_RANKING_RESULT", ...result }, null, 2));
+	return result;
 }
 
 function estimateRangeDaysFromPeriod(period?: string): number {
