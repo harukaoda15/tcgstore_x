@@ -141,6 +141,7 @@ type MonitorEnv = Env & {
 	ANTHROPIC_MODEL?: string;
 	TELEGRAM_BOT_TOKEN?: string;
 	TELEGRAM_CHAT_ID?: string;
+	TELEGRAM_THREAD_ID?: string;
 	APPROVE_SECRET_TOKEN?: string;
 };
 
@@ -274,14 +275,18 @@ const MERCARI_DAILY_AI_SYSTEM_PROMPT = `あなたはTCGSTOREのX運用担当。
 
 async function sendTelegram(text: string, env: MonitorEnv): Promise<void> {
 	if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+	const body: Record<string, unknown> = {
+		chat_id: env.TELEGRAM_CHAT_ID,
+		text,
+		parse_mode: "HTML",
+	};
+	if (env.TELEGRAM_THREAD_ID) {
+		body.message_thread_id = Number(env.TELEGRAM_THREAD_ID);
+	}
 	await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			chat_id: env.TELEGRAM_CHAT_ID,
-			text,
-			parse_mode: "HTML",
-		}),
+		body: JSON.stringify(body),
 	});
 }
 
