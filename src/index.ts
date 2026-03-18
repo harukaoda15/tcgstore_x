@@ -4712,9 +4712,15 @@ function buildPriceRankingMessage(
 	const dow = jstDate.getUTCDay();
 	const dateLabel = `${month}/${day}(${WEEKDAY_LABELS[dow]})`;
 
+	const topSourceSite = ranked[0]?.entry.sourceSite ?? null;
+	const sourceLabel = topSourceSite === "snkrdunk" ? "snkrdunk調べ"
+		: topSourceSite === "pokeca-chart" ? "pokeca-chart調べ"
+		: null;
+	const themeLine = sourceLabel ? `${theme.label}（${sourceLabel}）` : theme.label;
+
 	const lines: string[] = [
 		`【${dateLabel}ポケカ相場】`,
-		theme.label,
+		themeLine,
 	];
 
 	const top3 = ranked.slice(0, 3);
@@ -4727,8 +4733,7 @@ function buildPriceRankingMessage(
 		if (theme.sortBy === "current_price") {
 			const emoji = PRICE_EMOJIS[i] ?? "🏅";
 			lines.push(`${emoji} ${cardName}`);
-			const sourceSuffix = i === 0 ? "（snkrdunk調べ）" : "";
-			lines.push(`${formatNumber(currentPrice)}円${sourceSuffix}`);
+			lines.push(`${formatNumber(currentPrice)}円`);
 		} else {
 			const emoji = CHANGE_EMOJIS[i] ?? "🏅";
 
@@ -4826,9 +4831,9 @@ async function runPriceRanking(
 
 	const message = buildPriceRankingMessage(top3, theme, jstNow);
 
-	// Fetch official card image for the top card
+	// Fetch card image: use watchlist imageUrl first, fall back to official API
 	const topCardName = top3[0].entry.cardName || top3[0].entry.card || "";
-	const cardImageUrl = await fetchOfficialCardImage(topCardName);
+	const cardImageUrl = top3[0].entry.imageUrl ?? await fetchOfficialCardImage(topCardName);
 
 	let postedToX = false;
 	let committed = false;
