@@ -489,9 +489,9 @@ export default {
 		if (event.cron === "0 12 * * *") {
 			if (ENABLE_PRICE_RANKING_DAILY) {
 				const rankResult = await runPriceRanking(env, { commit: true, logToConsole: true, fromSchedule: true });
-				// ウォッチリストデータ不足時はfresh_price_rankingにフォールバック
+				// ウォッチリストデータ不足時はmarket_summaryにフォールバック
 				if (!rankResult.ok) {
-					await runFreshPriceRanking(env, { commit: true, logToConsole: true, fromSchedule: true });
+					await runMarketSummary(env, { commit: true, logToConsole: true, fromSchedule: true });
 				}
 			} else if (ENABLE_MARKET_SUMMARY_DAILY) {
 				await runMarketSummary(env, { commit: true, logToConsole: true, fromSchedule: true });
