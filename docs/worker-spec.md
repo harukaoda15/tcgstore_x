@@ -88,6 +88,8 @@
   - ハッシュタグは `#ポケカ` 1つのみ
   - 煽り・断定・予測は禁止
   - 画像は watchlist の `imageUrl` から最大3枚添付
+  - AIモデルは `MARKET_SUMMARY_MODEL` を優先（未設定時は低コストモデル）
+  - `MARKET_SUMMARY_USE_AI=false` の場合はテンプレフォールバック投稿
 
 ## 機能3: TCG STORE daily 紹介（AI）【停止中】
 
@@ -281,13 +283,12 @@
   - 既に存在する場合は `skipped: true` で終了
   - 実投稿成功時のみTTL 21600秒（6時間）で記録
 - 投稿文:
-  - Anthropic 生成（失敗時はフォールバック文）
-  - 人格: ポケカ好きな情報通が、相場の動きをさらっと共有するトーン
+  - デフォルトはテンプレ固定（AI不使用）
+  - `PRICE_SPIKE_USE_AI=true` の場合のみ Anthropic 生成を使用
   - 構成:
-    - 1行目: `カード名 + {period}で+{変化率}%`
-      - `period` 未指定時は `直近` を使う（例: `直近で+8.08%`）
-    - 2行目: `{前回価格}円 → {現在価格}円（+{変化率}%）`
-    - 3行目: 背景の推察をやわらかく一文
+    - 1行目: `カード名`
+    - 2行目: `{前回価格}円 → {現在価格}円（{period} ±{変化率}%）`
+    - 3行目: `#ポケカ`
     - URLは付与しない（市場情報のみ）
   - `#ポケカ` 固定
   - 60〜100文字
@@ -305,4 +306,7 @@
 - Anthropic:
   - `ANTHROPIC_API_KEY`
   - `ANTHROPIC_MODEL`（未設定時デフォルト利用）
+  - `MARKET_SUMMARY_MODEL`（市場まとめ用。未設定時は低コストモデル）
+  - `MARKET_SUMMARY_USE_AI`（true/false、既定true）
+  - `PRICE_SPIKE_USE_AI`（true/false、既定false）
 

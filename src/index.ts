@@ -139,6 +139,9 @@ type MonitorEnv = Env & {
 	X_ACCESS_TOKEN_SECRET?: string;
 	ANTHROPIC_API_KEY?: string;
 	ANTHROPIC_MODEL?: string;
+	PRICE_SPIKE_USE_AI?: string;
+	MARKET_SUMMARY_USE_AI?: string;
+	MARKET_SUMMARY_MODEL?: string;
 };
 
 type StateStore = {
@@ -237,6 +240,7 @@ const MARKET_SUMMARY_SYSTEM_PROMPT = `あなたはポケカ市場情報を簡潔
 - URL含めない
 - 3〜5件まとめる
 - 煽り・断定・予測禁止`;
+const DEFAULT_MARKET_SUMMARY_MODEL = "claude-3-5-haiku-latest";
 
 const MERCARI_DAILY_AI_SYSTEM_PROMPT = `あなたはTCGSTOREのX運用担当。
 メルカリくじの紹介投稿を作るが、広告っぽさよりも「読む価値」を優先する。
@@ -642,11 +646,21 @@ async function runPriceSpikeMode(
 			};
 		}
 
-		const aiResult = await generatePriceSpikeMessage(spike, env);
-		const previewMessage =
-			aiResult.ok && aiResult.message
-				? aiResult.message
-				: buildPriceSpikeFallbackMessage(spike);
+		const usePriceSpikeAi = isPriceSpikeAiEnabled(env);
+		let aiUsed = false;
+		let aiReason: string | null = null;
+		let previewMessage = buildPriceSpikeFallbackMessage(spike);
+		if (usePriceSpikeAi) {
+			const aiResult = await generatePriceSpikeMessage(spike, env);
+			if (aiResult.ok && aiResult.message) {
+				previewMessage = aiResult.message;
+				aiUsed = true;
+			} else {
+				aiReason = aiResult.reason ?? "price_spike_ai_failed";
+			}
+		} else {
+			aiReason = "price_spike_ai_disabled";
+		}
 
 		let postedToX = false;
 		let committed = false;
@@ -675,6 +689,8 @@ async function runPriceSpikeMode(
 			postedToX,
 			previewMessage,
 			skipped: false,
+			aiUsed,
+			aiReason,
 			watchlistCount: watchlist.length,
 			xResponse,
 		};
@@ -819,8 +835,11 @@ async function generateMarketSummaryMessage(
 	theme: { label: string; emoji: string; sortBy: "change_desc" | "change_asc" | "spike_recent" | "price_desc" },
 	env: MonitorEnv,
 ): Promise<{ ok: boolean; message?: string; reason?: string }> {
+	if (!isMarketSummaryAiEnabled(env)) {
+		return { ok: false, reason: "market_summary_ai_disabled" };
+	}
 	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
-	const model = env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+	const model = resolveMarketSummaryModel(env);
 	const jstLabel = getJstMarketSummaryLabel();
 	const lines = picked.map((item, idx) => {
 		const startPrice = getSummaryStartPrice(item);
@@ -1025,6 +1044,28 @@ function compactCardLabel(card: string): string {
 	return cleaned.length > 42 ? `${cleaned.slice(0, 42)}…` : cleaned;
 }
 
+function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
+	const normalized = String(value ?? "").trim().toLowerCase();
+	if (!normalized) return defaultValue;
+	if (["1", "true", "yes", "on"].includes(normalized)) return true;
+	if (["0", "false", "no", "off"].includes(normalized)) return false;
+	return defaultValue;
+}
+
+function isPriceSpikeAiEnabled(env: MonitorEnv): boolean {
+	return parseBooleanEnv(env.PRICE_SPIKE_USE_AI, false);
+}
+
+function isMarketSummaryAiEnabled(env: MonitorEnv): boolean {
+	return parseBooleanEnv(env.MARKET_SUMMARY_USE_AI, true);
+}
+
+function resolveMarketSummaryModel(env: MonitorEnv): string {
+	const custom = String(env.MARKET_SUMMARY_MODEL ?? "").trim();
+	if (custom) return custom;
+	return DEFAULT_MARKET_SUMMARY_MODEL;
+}
+
 async function generatePriceSpikeMessage(
 	spike: PriceSpikeItem,
 	env: MonitorEnv,
@@ -1107,10 +1148,11 @@ function validatePriceSpikeMessage(
 function buildPriceSpikeFallbackMessage(spike: PriceSpikeItem): string {
 	const period = normalizePriceSpikePeriod(spike.period);
 	const cardName = getCanonicalPriceSpikeCardName(spike);
+	const pct = Number(spike.change_pct);
+	const sign = pct >= 0 ? "+" : "-";
 	const lines = [
-		`${cardName}、${period}で+${Number(spike.change_pct).toFixed(2)}%。`,
-		`${formatNumber(spike.before)}円 → ${formatNumber(spike.after)}円（+${Number(spike.change_pct).toFixed(2)}%）`,
-		"需給や注目度の重なりが出てきたのかも。",
+		`${cardName}`,
+		`${formatNumber(spike.before)}円 → ${formatNumber(spike.after)}円（${period} ${sign}${Math.abs(pct).toFixed(2)}%）`,
 		"#ポケカ",
 	];
 	return lines.join("\n");
