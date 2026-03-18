@@ -178,6 +178,27 @@ const DAILY_SPOTLIGHT_ENABLED = false;
 const ENABLE_TCG_DAILY_SPOTLIGHT = false;
 const ENABLE_MERCARI_DAILY_SPOTLIGHT = false;
 const ENABLE_MARKET_SUMMARY_DAILY = true;
+const ENABLE_PRICE_RANKING_DAILY = true;
+
+type CharacterFilter = {
+	label: string;
+	keywords: string[];
+	cardIds: string[];
+};
+
+const CHARACTER_FILTERS: Record<string, CharacterFilter> = {
+	pikachu: {
+		label: "ピカチュウ",
+		keywords: ["ピカチュウ", "Pikachu"],
+		cardIds: [],
+	},
+	charizard: {
+		label: "リザードン",
+		keywords: ["リザードン", "Charizard"],
+		cardIds: [],
+	},
+};
+
 const DAILY_AI_PATTERN_ORDER: DailyAiPattern[] = [
 	"market_analysis",
 	"contrarian",
