@@ -1,4 +1,4 @@
-type AlertLevel = "under_5" | "under_1";
+type AlertLevel = "under_200" | "under_100";
 type MonitorSource = "mercari" | "tcgstore";
 
 type RunMonitorOptions = {
@@ -167,9 +167,9 @@ const DAILY_LAST_SOURCE_KEY = "last_daily_source";
 const LATEST_MARKET_CONTEXT_KEY = "latest_market_context";
 const DAILY_RECENT_HISTORY_LIMIT = 10;
 const ALERT_MARKET_CHANGE_PCT_MIN = 8;
-const ALERT_THRESHOLDS: Record<MonitorSource, { low: number; high: number }> = {
-	mercari: { low: 10, high: 5 },
-	tcgstore: { low: 5, high: 1 },
+const ALERT_THRESHOLDS: Record<MonitorSource, { low: number; high: number; metric: "count" | "percent" }> = {
+	mercari: { low: 200, high: 100, metric: "count" },
+	tcgstore: { low: 5, high: 1, metric: "percent" },
 };
 const WATCHLIST_KEY = "watchlist";
 const WATCHLIST_TTL_MS = 1000 * 60 * 60 * 24 * 7;
@@ -2761,7 +2761,7 @@ async function runMonitor(
 	const commit = forceCommit || reqUrl.searchParams.get("commit") === "1";
 	const forceLevelParam = reqUrl.searchParams.get("forceLevel");
 	const requestForceLevel =
-		forceLevelParam === "under_1" || forceLevelParam === "under_5"
+		forceLevelParam === "under_100" || forceLevelParam === "under_200"
 			? forceLevelParam
 			: null;
 	const activeForceLevel = forceLevel ?? requestForceLevel;
@@ -2780,11 +2780,12 @@ async function runMonitor(
 		const title = pickedTitle.title;
 		const matchedMarketContext = pickAlertMarketContext(title, marketContext);
 
-		const under5Key = `${item.source}:${item.url}:under5`;
-		const under1Key = `${item.source}:${item.url}:under1`;
+		const under200Key = `${item.source}:${item.url}:under200`;
+		const under100Key = `${item.source}:${item.url}:under100`;
+		const lastTweetIdKey = `${item.source}:${item.url}:last_tweet_id`;
 
-		const under5Posted = (await stateStore.get(under5Key)) === "1";
-		const under1Posted = (await stateStore.get(under1Key)) === "1";
+		const under200Posted = (await stateStore.get(under200Key)) === "1";
+		const under100Posted = (await stateStore.get(under100Key)) === "1";
 
 		let action = "none";
 		let committed = false;
@@ -2792,19 +2793,28 @@ async function runMonitor(
 		let xResponse: unknown = null;
 		let previewMessage: string | null = null;
 
-		const shouldForceUnder1 = activeForceLevel === "under_1";
-		const shouldForceUnder5 = activeForceLevel === "under_5";
+		const shouldForceUnder100 = activeForceLevel === "under_100";
+		const shouldForceUnder200 = activeForceLevel === "under_200";
 		const thresholds = ALERT_THRESHOLDS[item.source];
 
-		if ((detail.percent <= thresholds.high || shouldForceUnder1) && !under1Posted) {
-			action = "notify_under_1";
+		const meetsHighThreshold =
+			thresholds.metric === "count"
+				? detail.detailRemaining !== null && detail.detailRemaining <= thresholds.high
+				: detail.percent !== null && detail.percent <= thresholds.high;
+		const meetsLowThreshold =
+			thresholds.metric === "count"
+				? detail.detailRemaining !== null && detail.detailRemaining <= thresholds.low
+				: detail.percent !== null && detail.percent <= thresholds.low;
+
+		if ((meetsHighThreshold || shouldForceUnder100) && !under100Posted) {
+			action = "notify_under_100";
 			previewMessage = buildAlertMessage({
 				source: item.source,
 				title,
 				remaining: detail.detailRemaining,
 				totalCount: detail.totalCount,
 				url: item.url,
-				level: "under_1",
+				level: "under_100",
 				includeLastPrize: Boolean(detail.lastOneImageUrl),
 				marketContext: matchedMarketContext,
 			});
@@ -2823,19 +2833,23 @@ async function runMonitor(
 				xResponse = postResult;
 
 				if (postResult.ok) {
-					await stateStore.put(under1Key, "1");
+					await stateStore.put(under100Key, "1");
 					committed = true;
+					const tweetId = extractPostedTweetId(postResult);
+					if (tweetId && item.source === "mercari") {
+						await stateStore.put(lastTweetIdKey, tweetId);
+					}
 				}
 			}
-		} else if ((detail.percent <= thresholds.low || shouldForceUnder5) && !under5Posted) {
-			action = "notify_under_5";
+		} else if ((meetsLowThreshold || shouldForceUnder200) && !under200Posted) {
+			action = "notify_under_200";
 			previewMessage = buildAlertMessage({
 				source: item.source,
 				title,
 				remaining: detail.detailRemaining,
 				totalCount: detail.totalCount,
 				url: item.url,
-				level: "under_5",
+				level: "under_200",
 				includeLastPrize: Boolean(detail.lastOneImageUrl),
 				marketContext: matchedMarketContext,
 			});
@@ -2854,8 +2868,38 @@ async function runMonitor(
 				xResponse = postResult;
 
 				if (postResult.ok) {
-					await stateStore.put(under5Key, "1");
+					await stateStore.put(under200Key, "1");
 					committed = true;
+					const tweetId = extractPostedTweetId(postResult);
+					if (tweetId && item.source === "mercari") {
+						await stateStore.put(lastTweetIdKey, tweetId);
+					}
+				}
+			}
+		}
+
+		// Sold-out detection for Mercari
+		if (item.source === "mercari" && detail.detailRemaining === 0 && action === "none") {
+			const soldOutKey = `${item.source}:${item.url}:sold_out`;
+			const soldOutPosted = (await stateStore.get(soldOutKey)) === "1";
+			if (!soldOutPosted) {
+				const lastTweetId = await stateStore.get(lastTweetIdKey);
+				if (commit && lastTweetId) {
+					const quoteResult = await postQuoteTweet(
+						"✅ 完売しました！ありがとうございました🙏",
+						lastTweetId,
+						env,
+					);
+					if (quoteResult.ok) {
+						await stateStore.put(soldOutKey, "1");
+						await stateStore.put(lastTweetIdKey, "");
+						action = "notify_sold_out";
+						committed = true;
+						postedToX = true;
+						xResponse = quoteResult;
+					}
+				} else if (!commit) {
+					action = "would_notify_sold_out";
 				}
 			}
 		}
@@ -2903,8 +2947,8 @@ async function runMonitor(
 			lastOneImageUrl: detail.lastOneImageUrl,
 			imageUrls: detail.imageUrls,
 			marketContext: matchedMarketContext,
-			under5Posted,
-			under1Posted,
+			under200Posted,
+			under100Posted,
 			action,
 			committed,
 			postedToX,
@@ -2977,11 +3021,11 @@ function buildAlertMessage({
 	const safeTotal = Number.isFinite(totalCount) ? String(totalCount) : "?";
 	const headerPrefix = source === "tcgstore" ? "TCGSTOREオリパ" : "メルカリくじ";
 	const lastPrizeLabel = source === "tcgstore" ? "ラスト賞" : "ラスイチ賞";
-	const hotIcon = level === "under_1" ? "🔥" : "🏆";
+	const hotIcon = level === "under_100" ? "🔥" : "🏆";
 
 	const lines: string[] = [];
 
-	if (level === "under_1") {
+	if (level === "under_100") {
 		lines.push(`🚨 ${headerPrefix}「${title}」`, "残りわずか!");
 	} else {
 		lines.push(`🎯 ${headerPrefix}「${title}」`, "残り少なくなってきました!");
@@ -3039,7 +3083,7 @@ function buildMercariAlertMessage({
 	];
 	const mood = moodEmojiSets[seed % moodEmojiSets.length];
 	const phaseLine =
-		level === "under_1"
+		level === "under_100"
 			? low1Lines[seed % low1Lines.length]
 			: low5Lines[seed % low5Lines.length];
 	const closePair = closePairs[seed % closePairs.length];
@@ -4132,6 +4176,44 @@ function getSummaryStartPrice(entry: WatchlistEntry): number {
 function calcPercentChange(before: number, after: number): number {
 	if (!Number.isFinite(before) || before <= 0 || !Number.isFinite(after)) return 0;
 	return ((after - before) / before) * 100;
+}
+
+function extractPostedTweetId(postResult: Record<string, unknown>): string | null {
+	try {
+		const data = (postResult.data as { data?: { id?: string } } | undefined)?.data?.id;
+		return typeof data === "string" && data.length > 0 ? data : null;
+	} catch {
+		return null;
+	}
+}
+
+async function postQuoteTweet(
+	text: string,
+	quoteTweetId: string,
+	env: MonitorEnv,
+): Promise<Record<string, unknown> & { ok: boolean }> {
+	const endpoint = "https://api.x.com/2/tweets";
+	if (!env.X_API_KEY || !env.X_API_KEY_SECRET || !env.X_ACCESS_TOKEN || !env.X_ACCESS_TOKEN_SECRET) {
+		return { ok: false, status: 0, error: "Missing X secrets" };
+	}
+	const body = JSON.stringify({ text, quote_tweet_id: quoteTweetId });
+	const authorization = await buildOAuth1Header({
+		method: "POST",
+		url: endpoint,
+		consumerKey: env.X_API_KEY,
+		consumerSecret: env.X_API_KEY_SECRET,
+		token: env.X_ACCESS_TOKEN,
+		tokenSecret: env.X_ACCESS_TOKEN_SECRET,
+	});
+	const res = await fetch(endpoint, {
+		method: "POST",
+		headers: { Authorization: authorization, "Content-Type": "application/json" },
+		body,
+	});
+	const raw = await res.text();
+	let data: unknown = null;
+	try { data = JSON.parse(raw); } catch { data = { raw }; }
+	return { ok: res.ok, status: res.status, data };
 }
 
 function estimateRangeDaysFromPeriod(period?: string): number {
