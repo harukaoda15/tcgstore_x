@@ -385,6 +385,11 @@ export default {
 			return jsonResponse(result);
 		}
 
+		if (mode === "seed_watchlist_from_pokeca") {
+			const result = await runSeedWatchlistFromPokeca(env, { logToConsole: true });
+			return jsonResponse(result);
+		}
+
 		if (reqUrl.pathname === "/approve") {
 			const token = reqUrl.searchParams.get("token");
 			const key = reqUrl.searchParams.get("key");
@@ -713,6 +718,207 @@ async function fetchPokecaChartTrending(): Promise<string> {
 	} catch {
 		return "";
 	}
+}
+
+type PokecaChartTrendingCard = {
+	name: string;
+	url: string;
+	rankingType: "surge" | "fall" | "volume";
+};
+
+type PokecaChartCardHistory = {
+	currentPrice: number;
+	priceHistory: Array<{ date: string; price: number }>;
+	imageUrl: string | null;
+	cardName: string | null;
+};
+
+async function fetchPokecaChartTrendingCards(): Promise<PokecaChartTrendingCard[]> {
+	try {
+		const res = await fetch("https://pokeca-chart.com/", {
+			headers: { "user-agent": "Mozilla/5.0" },
+		});
+		if (!res.ok) return [];
+		const html = await res.text();
+
+		const cards: PokecaChartTrendingCard[] = [];
+		const sectionDefs: { label: string; type: PokecaChartTrendingCard["rankingType"] }[] = [
+			{ label: "高騰ランキング", type: "surge" },
+			{ label: "下落ランキング", type: "fall" },
+			{ label: "取引件数ランキング", type: "volume" },
+		];
+
+		for (const { label, type } of sectionDefs) {
+			const sectionRegex = new RegExp(
+				`<h2[^>]*>[^<]*${label}[^<]*<\\/h2>([\\s\\S]*?)(?=<h2[^>]*>|$)`,
+				"i",
+			);
+			const sectionMatch = html.match(sectionRegex);
+			if (!sectionMatch) continue;
+			const sectionHtml = sectionMatch[1];
+			// Extract card links: <a href="/card/..."> or <a href="https://pokeca-chart.com/card/...">
+			const linkRegex = /href="((?:https:\/\/pokeca-chart\.com)?\/card\/[^"]+)"/gi;
+			let m: RegExpExecArray | null;
+			while ((m = linkRegex.exec(sectionHtml)) !== null) {
+				const rawHref = m[1];
+				const url = rawHref.startsWith("http") ? rawHref : `https://pokeca-chart.com${rawHref}`;
+				// Extract name from surrounding text - look for visible text near the link
+				const linkStart = sectionHtml.lastIndexOf("<a", m.index ?? 0);
+				const linkEnd = sectionHtml.indexOf("</a>", m.index ?? 0) + 4;
+				const linkFragment = sectionHtml.slice(linkStart, linkEnd);
+				const name = stripTags(linkFragment).replace(/\s+/g, " ").trim();
+				if (name && url && !cards.some((c) => c.url === url)) {
+					cards.push({ name, url, rankingType: type });
+				}
+			}
+		}
+		return cards.slice(0, WATCHLIST_LIMIT);
+	} catch {
+		return [];
+	}
+}
+
+async function fetchPokecaChartCardHistory(url: string): Promise<PokecaChartCardHistory | null> {
+	try {
+		const res = await fetch(url, {
+			headers: { "user-agent": "Mozilla/5.0" },
+		});
+		if (!res.ok) return null;
+		const html = await res.text();
+
+		const priceHistory = extractPriceHistoryFromPokecaChartHtml(html);
+
+		// Extract current price from meta/og or structured data
+		let currentPrice = 0;
+		const priceMetaMatch = html.match(/["']price["']\s*:\s*([0-9]+)/);
+		if (priceMetaMatch) currentPrice = Number(priceMetaMatch[1]);
+		if (!currentPrice && priceHistory.length > 0) {
+			currentPrice = priceHistory[priceHistory.length - 1].price;
+		}
+
+		// Extract card name from og:title or <title>
+		const cardName = extractSourceTitle(html);
+
+		// Extract image URL
+		const ogImageMatch = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
+		const imageUrl = ogImageMatch?.[1] ?? null;
+
+		return { currentPrice, priceHistory, imageUrl, cardName };
+	} catch {
+		return null;
+	}
+}
+
+async function runSeedWatchlistFromPokeca(
+	env: MonitorEnv,
+	options: { logToConsole?: boolean } = {},
+): Promise<Record<string, unknown>> {
+	const { logToConsole = true } = options;
+	const stateStore = createStateStore(env);
+
+	const trendingCards = await fetchPokecaChartTrendingCards();
+	if (trendingCards.length === 0) {
+		return { ok: false, reason: "no_trending_cards_found" };
+	}
+
+	const nowIso = new Date().toISOString();
+	const today = nowIso.slice(0, 10);
+	const seeded: string[] = [];
+	const skipped: string[] = [];
+
+	for (const card of trendingCards.slice(0, WATCHLIST_LIMIT)) {
+		// Rate-limit: 100ms between requests
+		await new Promise((r) => setTimeout(r, 100));
+
+		const history = await fetchPokecaChartCardHistory(card.url);
+		if (!history || history.priceHistory.length < 2) {
+			skipped.push(card.name);
+			continue;
+		}
+
+		const currentPrice = history.currentPrice || history.priceHistory[history.priceHistory.length - 1].price;
+		const oldestPrice = history.priceHistory[0].price;
+		if (!currentPrice || !oldestPrice) {
+			skipped.push(card.name);
+			continue;
+		}
+
+		const cardName = (history.cardName && history.cardName.length > 1) ? history.cardName : card.name;
+		const cardId = card.url.replace(/.*\/card\//, "").replace(/[/?#].*/, "").trim() || null;
+		const key = `pokeca-chart:${(cardId || cardName).toLowerCase()}`;
+		const changePct = calcPercentChange(oldestPrice, currentPrice);
+
+		// Build the 3-point price history: 30d ago, 7d ago, today
+		const refDate = new Date(nowIso);
+		const pick = (daysAgo: number): { date: string; price: number } | null => {
+			const targetMs = refDate.getTime() - daysAgo * 24 * 60 * 60 * 1000;
+			let best: { row: { date: string; price: number }; diff: number } | null = null;
+			for (const row of history.priceHistory) {
+				const t = new Date(`${row.date}T00:00:00Z`).getTime();
+				if (!Number.isFinite(t)) continue;
+				const diff = Math.abs(t - targetMs);
+				if (!best || diff < best.diff) best = { row, diff };
+			}
+			if (!best || best.diff > 10 * 24 * 60 * 60 * 1000) return null;
+			return best.row;
+		};
+		const p30 = pick(30);
+		const p7 = pick(7);
+		const seedHistory = [p30, p7, { date: today, price: currentPrice }]
+			.filter((x): x is { date: string; price: number } => Boolean(x))
+			.filter((x, i, arr) => arr.findIndex((y) => y.date === x.date) === i)
+			.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+		const beforePrice = p30?.price ?? p7?.price ?? currentPrice;
+		const entry: WatchlistEntry = {
+			key,
+			cardName,
+			card: cardName,
+			cardId,
+			sourceUrl: card.url,
+			sourceSite: "pokeca-chart",
+			firstSeenAt: nowIso,
+			lastSeenAt: nowIso,
+			currentPrice,
+			beforePrice,
+			afterPrice: currentPrice,
+			changePct,
+			period: "30日",
+			imageUrl: normalizeWatchImageUrl(history.imageUrl, "pokeca-chart"),
+			firstSeenPrice: beforePrice,
+			priceHistory: seedHistory,
+		};
+
+		// Upsert into watchlist (merge with existing)
+		const current = await getWatchlistEntries(stateStore);
+		const existingIdx = current.findIndex((e) => e.key === key);
+		let merged: WatchlistEntry[];
+		if (existingIdx >= 0) {
+			// Merge price history with existing
+			const existing = current[existingIdx];
+			const mergedHistory = normalizeWatchPriceHistory([...existing.priceHistory, ...seedHistory]);
+			const updated: WatchlistEntry = { ...entry, firstSeenAt: existing.firstSeenAt, firstSeenPrice: existing.firstSeenPrice, priceHistory: mergedHistory };
+			merged = [updated, ...current.filter((_, i) => i !== existingIdx)]
+				.sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime())
+				.slice(0, WATCHLIST_LIMIT);
+		} else {
+			merged = [entry, ...current]
+				.sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime())
+				.slice(0, WATCHLIST_LIMIT);
+		}
+		await stateStore.put(WATCHLIST_KEY, JSON.stringify(merged));
+		seeded.push(cardName);
+	}
+
+	const result = {
+		ok: true,
+		seededCount: seeded.length,
+		skippedCount: skipped.length,
+		seeded,
+		skipped,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "SEED_WATCHLIST_FROM_POKECA", ...result }, null, 2));
+	return result;
 }
 
 async function runDailyWeb3Info(
