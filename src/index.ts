@@ -199,12 +199,6 @@ const DAILY_PHRASES = [
 ];
 const TCGSTORE_AI_SYSTEM_PROMPT = `あなたはTCGSTOREの公式Xアカウントの投稿を生成するAIです。
 
-## アカウントのキャラクター
-- ポケモンカード専門店の店員が語るトーン
-- 専門的だが小難しくない。ポケカ好きの友人に話す感覚
-- 売り込み感は出さない。「教えたい」「共有したい」がベース
-- 「ですます」調ではなく、自然な口調。ただし丁寧さは保つ
-
 ## ルール
 - 投稿全体は100〜140文字以内に収める
 - 投資勧誘と取られる表現は禁止（「絶対上がる」「買うべき」など）
@@ -1060,10 +1054,84 @@ async function refreshWatchlistPrices(
 	return result;
 }
 
+async function fetchCourtyardPokemonData(): Promise<string> {
+	try {
+		// Courtyard.io: NFT marketplace for tokenized physical Pokemon cards (Polygon network)
+		// Their collection activity page exposes recent sales and price data
+		const res = await fetch("https://courtyard.io/collection/pokemon-trading-cards", {
+			headers: {
+				"user-agent": "Mozilla/5.0 (compatible; MarketBot/1.0)",
+				accept: "text/html,application/xhtml+xml",
+			},
+		});
+		if (!res.ok) return "";
+		const html = await res.text();
+
+		// Try to extract __NEXT_DATA__ for structured JSON data
+		const nextDataMatch = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+		if (nextDataMatch?.[1]) {
+			try {
+				const nextData = JSON.parse(nextDataMatch[1]) as Record<string, unknown>;
+				const pageProps = (nextData as { props?: { pageProps?: Record<string, unknown> } })?.props
+					?.pageProps;
+				const hints: string[] = [];
+				if (pageProps) {
+					const fp = (pageProps.floorPrice ?? (pageProps.collection as Record<string, unknown> | undefined)?.floorPrice) as number | string | undefined;
+					const vol = (pageProps.volume24h ?? (pageProps.collection as Record<string, unknown> | undefined)?.volume24h) as number | string | undefined;
+					const listings = (pageProps.totalListings ?? (pageProps.collection as Record<string, unknown> | undefined)?.totalListings) as number | string | undefined;
+					if (fp) hints.push(`フロア: $${fp}`);
+					if (vol) hints.push(`24h出来高: $${vol}`);
+					if (listings) hints.push(`出品数: ${listings}`);
+				}
+				if (hints.length > 0) return `Courtyard.io ポケカNFT: ${hints.join(" / ")}`;
+			} catch {
+				// fall through to text extraction
+			}
+		}
+
+		// Fallback: extract visible text and find price-like patterns
+		const text = stripTags(html).replace(/\s+/g, " ").trim();
+		const priceMatches = [...text.matchAll(/\$\s*([0-9,]+(?:\.[0-9]+)?)/g)]
+			.map((m) => Number(String(m[1]).replace(/,/g, "")))
+			.filter((n) => Number.isFinite(n) && n > 0)
+			.sort((a, b) => b - a)
+			.slice(0, 5);
+		if (priceMatches.length > 0) {
+			return `Courtyard.io ポケカNFT 最近の価格帯: ${priceMatches.map((p) => `$${p.toLocaleString()}`).join(", ")}`;
+		}
+		return "";
+	} catch {
+		return "";
+	}
+}
+
+async function fetchOfficialCardImageUrl(cardName: string, apiKey?: string): Promise<string | null> {
+	// Pokemon TCG API (api.pokemontcg.io) - free tier: ~30req/min without key, 1000req/day with key
+	// POKEMON_TCG_API_KEY can be set as a Worker secret for higher rate limits
+	try {
+		const query = encodeURIComponent(`name:"${cardName.replace(/"/g, "")}"`);
+		const headers: Record<string, string> = { "user-agent": "Mozilla/5.0" };
+		if (apiKey) headers["X-Api-Key"] = apiKey;
+		const res = await fetch(
+			`https://api.pokemontcg.io/v2/cards?q=${query}&orderBy=-set.releaseDate&pageSize=1&select=id,images`,
+			{ headers },
+		);
+		if (!res.ok) return null;
+		const data = (await res.json()) as {
+			data?: Array<{ images?: { large?: string; small?: string } }>;
+		};
+		const card = data.data?.[0];
+		return card?.images?.large ?? card?.images?.small ?? null;
+	} catch {
+		return null;
+	}
+}
+
 async function generateMarketSummaryMessage(
 	picked: WatchlistEntry[],
 	theme: { label: string; emoji: string; sortBy: "change_desc" | "change_asc" | "spike_recent" | "price_desc" },
 	env: MonitorEnv,
+	courtyardHints = "",
 ): Promise<{ ok: boolean; message?: string; reason?: string }> {
 	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
 	const model = env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
@@ -1074,6 +1142,15 @@ async function generateMarketSummaryMessage(
 		const pct = calcPercentChange(startPrice, item.currentPrice);
 		return `${idx + 1}. rank=${getRankBadge(idx)} card=${item.cardName} changeEmoji=${getChangeEmoji(pct)} price=${formatNumber(startPrice)}→${formatNumber(item.currentPrice)} range=${range} pct=${signedPercentText(pct)}`;
 	});
+	const web3Section =
+		courtyardHints
+			? [
+					"",
+					"【Web3市場（Courtyard.io）参考情報】",
+					courtyardHints,
+					"※ 言及する場合は「NFT市場でも」「ブロックチェーン上でも」などやわらかく補足する程度に留める",
+				].join("\n")
+			: "";
 	const prompt = [
 		"以下の監視銘柄データを元に、X投稿文を1本作成してください。",
 		`日付ラベル: ${jstLabel}`,
@@ -1081,6 +1158,7 @@ async function generateMarketSummaryMessage(
 		"",
 		"【監視銘柄】",
 		...lines,
+		web3Section,
 		"",
 		"【投稿フォーマット（厳守）】",
 		`1行目: 【M/D(曜)${theme.label}】`,
