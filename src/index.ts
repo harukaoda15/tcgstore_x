@@ -198,7 +198,14 @@ const CHARACTER_FILTERS: Record<string, CharacterFilter> = {
 		keywords: ["リザードン", "Charizard"],
 		cardIds: [],
 	},
+	nanjamo: {
+		label: "ナンジャモ",
+		keywords: ["ナンジャモ", "Iono"],
+		cardIds: [],
+	},
 };
+
+const RANKING_LAST_CARDS_KEY = "ranking:last_posted_cards";
 
 const DAILY_AI_PATTERN_ORDER: DailyAiPattern[] = [
 	"market_analysis",
@@ -390,6 +397,12 @@ export default {
 			return jsonResponse(result);
 		}
 
+		if (mode === "fresh_price_ranking") {
+			const commit = reqUrl.searchParams.get("commit") === "1";
+			const result = await runFreshPriceRanking(env, { commit, logToConsole: true });
+			return jsonResponse(result);
+		}
+
 		if (reqUrl.pathname === "/approve") {
 			const token = reqUrl.searchParams.get("token");
 			const key = reqUrl.searchParams.get("key");
@@ -475,7 +488,11 @@ export default {
 		}
 		if (event.cron === "0 12 * * *") {
 			if (ENABLE_PRICE_RANKING_DAILY) {
-				await runPriceRanking(env, { commit: true, logToConsole: true, fromSchedule: true });
+				const rankResult = await runPriceRanking(env, { commit: true, logToConsole: true, fromSchedule: true });
+				// ウォッチリストデータ不足時はfresh_price_rankingにフォールバック
+				if (!rankResult.ok) {
+					await runFreshPriceRanking(env, { commit: true, logToConsole: true, fromSchedule: true });
+				}
 			} else if (ENABLE_MARKET_SUMMARY_DAILY) {
 				await runMarketSummary(env, { commit: true, logToConsole: true, fromSchedule: true });
 			}
@@ -1806,6 +1823,22 @@ function extractCurrentPriceFromSourceHtml(html: string): number | null {
 		.filter((n) => Number.isFinite(n) && n > 100);
 	if (values.length === 0) return null;
 	return values.sort((a, b) => b - a)[0];
+}
+
+function extractSnkrdunkApparelPrice(html: string): number | null {
+	// snkrdunk apparel pages embed the used-min price in an HTML attribute (not visible text)
+	const attrMatch = html.match(/apparel-summary-used-min-price="[¥￥]([0-9][0-9,]+)/);
+	if (attrMatch?.[1]) {
+		const val = Number(attrMatch[1].replace(/,/g, ""));
+		if (Number.isFinite(val) && val > 0) return val;
+	}
+	// Fallback: dataLayer price
+	const dlMatch = html.match(/"item_price":(\d+)/);
+	if (dlMatch?.[1]) {
+		const val = Number(dlMatch[1]);
+		if (Number.isFinite(val) && val > 0) return val;
+	}
+	return null;
 }
 
 function extractSourceTitle(html: string): string | null {
@@ -4479,32 +4512,103 @@ function getPriceAtDaysAgo(
 	return { price: best.row.price, date: best.row.date };
 }
 
-type RankingThemeType = "7d_rise" | "7d_fall" | "30d_rise_amount" | "pikachu_7d_rise";
-
-type RankingTheme = {
-	type: RankingThemeType;
-	label: string;
-	days: number;
-	characterFilter: string | null;
+const JP_TO_EN_CARD_NAME: Record<string, string> = {
+	リザードン: "Charizard",
+	ピカチュウ: "Pikachu",
+	ミュウ: "Mew",
+	ナンジャモ: "Iono",
+	ルギア: "Lugia",
+	ミュウツー: "Mewtwo",
+	イーブイ: "Eevee",
+	ゲンガー: "Gengar",
+	カビゴン: "Snorlax",
+	エーフィ: "Espeon",
+	ブラッキー: "Umbreon",
+	リーフィア: "Leafeon",
+	グレイシア: "Glaceon",
+	ヒトカゲ: "Charmander",
+	フシギダネ: "Bulbasaur",
+	ゼニガメ: "Squirtle",
+	カイリュー: "Dragonite",
+	ガブリアス: "Garchomp",
 };
 
-function getDailyRankingTheme(jstDate: Date): RankingTheme {
-	const dow = jstDate.getUTCDay(); // 0=Sun, 1=Mon, ..., 6=Sat
-	switch (dow) {
-		case 1: // Mon
-		case 5: // Fri
-			return { type: "7d_rise", label: "7日値上がり率ランキング", days: 7, characterFilter: null };
-		case 2: // Tue
-		case 6: // Sat
-			return { type: "7d_fall", label: "7日値下がり率ランキング", days: 7, characterFilter: null };
-		case 3: // Wed
-		case 0: // Sun
-			return { type: "30d_rise_amount", label: "30日値上がり額ランキング", days: 30, characterFilter: null };
-		case 4: // Thu
-			return { type: "pikachu_7d_rise", label: "ピカチュウ関連7日値上がり率ランキング", days: 7, characterFilter: "pikachu" };
-		default:
-			return { type: "7d_rise", label: "7日値上がり率ランキング", days: 7, characterFilter: null };
+async function fetchOfficialCardImage(cardName: string): Promise<string | null> {
+	try {
+		let searchName = cardName;
+		for (const [jp, en] of Object.entries(JP_TO_EN_CARD_NAME)) {
+			if (cardName.includes(jp)) {
+				searchName = cardName.replace(jp, en);
+				break;
+			}
+		}
+		const query = encodeURIComponent(`name:"${searchName}"`);
+		const res = await fetch(`https://api.pokemontcg.io/v2/cards?q=${query}&pageSize=3`);
+		if (!res.ok) return null;
+		const data = (await res.json()) as {
+			data?: Array<{ images?: { large?: string; small?: string } }>;
+		};
+		return data.data?.[0]?.images?.large ?? data.data?.[0]?.images?.small ?? null;
+	} catch {
+		return null;
 	}
+}
+
+type RankingPostedCards = Array<{ cardId: string; cardName: string; postedAt: string }>;
+
+async function getRecentlyPostedCardKeys(stateStore: StateStore, days: number): Promise<Set<string>> {
+	const raw = await stateStore.get(RANKING_LAST_CARDS_KEY);
+	if (!raw) return new Set();
+	try {
+		const records = JSON.parse(raw) as RankingPostedCards;
+		const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+		return new Set(
+			records
+				.filter((r) => new Date(r.postedAt).getTime() > cutoff)
+				.map((r) => r.cardId || r.cardName),
+		);
+	} catch {
+		return new Set();
+	}
+}
+
+async function savePostedRankingCards(stateStore: StateStore, cards: WatchlistEntry[]): Promise<void> {
+	const raw = await stateStore.get(RANKING_LAST_CARDS_KEY);
+	let existing: RankingPostedCards = [];
+	try {
+		if (raw) existing = JSON.parse(raw) as RankingPostedCards;
+	} catch {
+		// ignore
+	}
+	const now = new Date().toISOString();
+	const newEntries: RankingPostedCards = cards.map((c) => ({
+		cardId: c.cardId ?? "",
+		cardName: c.cardName || c.card || "",
+		postedAt: now,
+	}));
+	const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+	const kept = existing.filter((r) => new Date(r.postedAt).getTime() > cutoff);
+	await stateStore.put(RANKING_LAST_CARDS_KEY, JSON.stringify([...kept, ...newEntries]));
+}
+
+const RANKING_THEMES = [
+	{ type: "7d_rise_rate",            label: "7日値上がり率ランキング",              days: 7  as number | null, sortBy: "change_rate"    as const, desc: true,  char: null as string | null },
+	{ type: "7d_fall_rate",            label: "7日値下がり率ランキング",              days: 7  as number | null, sortBy: "change_rate"    as const, desc: false, char: null as string | null },
+	{ type: "30d_rise_amount",         label: "30日値上がり額ランキング",             days: 30 as number | null, sortBy: "change_amount"  as const, desc: true,  char: null as string | null },
+	{ type: "current_price_all",       label: "現在価格ランキング",                   days: null,               sortBy: "current_price"  as const, desc: true,  char: null as string | null },
+	{ type: "current_price_pikachu",   label: "ピカチュウ現在価格ランキング",         days: null,               sortBy: "current_price"  as const, desc: true,  char: "pikachu" as string | null },
+	{ type: "current_price_charizard", label: "リザードン現在価格ランキング",         days: null,               sortBy: "current_price"  as const, desc: true,  char: "charizard" as string | null },
+	{ type: "current_price_nanjamo",   label: "ナンジャモ現在価格ランキング",         days: null,               sortBy: "current_price"  as const, desc: true,  char: "nanjamo" as string | null },
+	{ type: "7d_rise_pikachu",         label: "ピカチュウ7日値上がり率ランキング",   days: 7  as number | null, sortBy: "change_rate"    as const, desc: true,  char: "pikachu" as string | null },
+];
+
+type RankingTheme = (typeof RANKING_THEMES)[number];
+
+function getDailyRankingTheme(jstDate: Date): RankingTheme {
+	const dateStr = jstDate.toISOString().slice(0, 10).replace(/-/g, "");
+	const dateSeed = parseInt(dateStr, 10);
+	const idx = dateSeed % RANKING_THEMES.length;
+	return RANKING_THEMES[idx];
 }
 
 function filterWatchlistByCharacter(
@@ -4541,8 +4645,26 @@ function buildRankingEntries(
 ): RankingEntry[] {
 	const currentDateStr = jstDate.toISOString().slice(0, 10);
 	const entries: RankingEntry[] = [];
+
+	if (theme.sortBy === "current_price") {
+		for (const entry of watchlist) {
+			const currentPrice = entry.currentPrice;
+			if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+			entries.push({
+				entry,
+				pastPrice: 0,
+				pastDate: currentDateStr,
+				currentPrice,
+				currentDate: currentDateStr,
+				changePct: 0,
+				changeAmount: 0,
+			});
+		}
+		return entries;
+	}
+
 	for (const entry of watchlist) {
-		const past = getPriceAtDaysAgo(entry, theme.days, jstDate);
+		const past = getPriceAtDaysAgo(entry, theme.days!, jstDate);
 		if (!past) continue;
 		const currentPrice = entry.currentPrice;
 		if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
@@ -4566,12 +4688,13 @@ function buildRankingEntries(
 
 function sortRankingEntries(entries: RankingEntry[], theme: RankingTheme): RankingEntry[] {
 	const sorted = [...entries];
-	if (theme.type === "7d_fall") {
-		sorted.sort((a, b) => a.changePct - b.changePct);
-	} else if (theme.type === "30d_rise_amount") {
-		sorted.sort((a, b) => b.changeAmount - a.changeAmount);
+	if (theme.sortBy === "current_price") {
+		sorted.sort((a, b) => b.currentPrice - a.currentPrice);
+	} else if (theme.sortBy === "change_amount") {
+		sorted.sort((a, b) => theme.desc ? b.changeAmount - a.changeAmount : a.changeAmount - b.changeAmount);
 	} else {
-		sorted.sort((a, b) => b.changePct - a.changePct);
+		// change_rate
+		sorted.sort((a, b) => theme.desc ? b.changePct - a.changePct : a.changePct - b.changePct);
 	}
 	return sorted;
 }
@@ -4581,7 +4704,8 @@ function buildPriceRankingMessage(
 	theme: RankingTheme,
 	jstDate: Date,
 ): string {
-	const RANK_EMOJIS = ["🔥", "📈", "⚡"] as const;
+	const CHANGE_EMOJIS = ["🔥", "📈", "⚡"] as const;
+	const PRICE_EMOJIS = ["🥇", "🥈", "🥉"] as const;
 	const month = jstDate.getUTCMonth() + 1;
 	const day = jstDate.getUTCDate();
 	const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"] as const;
@@ -4596,31 +4720,40 @@ function buildPriceRankingMessage(
 	const top3 = ranked.slice(0, 3);
 	for (let i = 0; i < top3.length; i++) {
 		const { pastPrice, pastDate, currentPrice, currentDate, changePct, changeAmount } = top3[i];
-		const emoji = RANK_EMOJIS[i] ?? "🏅";
 		const cardName = compactCardLabel(top3[i].entry.cardName || top3[i].entry.card);
 
-		// Format dates as M/D
-		const fmtDate = (dateStr: string): string => {
-			const d = new Date(`${dateStr}T00:00:00Z`);
-			if (!Number.isFinite(d.getTime())) return dateStr;
-			return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
-		};
-
-		let changeStr: string;
-		if (theme.type === "30d_rise_amount") {
-			const sign = changeAmount >= 0 ? "+" : "-";
-			changeStr = `${sign}${formatNumber(Math.abs(changeAmount))}円`;
-		} else {
-			const sign = changePct >= 0 ? "+" : "";
-			changeStr = `${sign}${changePct.toFixed(1)}%`;
-		}
-
-		const periodStr = `${fmtDate(pastDate)}→${fmtDate(currentDate)}`;
-		const priceStr = `${formatNumber(pastPrice)}円→${formatNumber(currentPrice)}円`;
-
 		lines.push("");
-		lines.push(`${emoji} ${cardName}`);
-		lines.push(`${priceStr}（${periodStr} ${changeStr}）`);
+
+		if (theme.sortBy === "current_price") {
+			const emoji = PRICE_EMOJIS[i] ?? "🏅";
+			lines.push(`${emoji} ${cardName}`);
+			const sourceSuffix = i === 0 ? "（snkrdunk調べ）" : "";
+			lines.push(`${formatNumber(currentPrice)}円${sourceSuffix}`);
+		} else {
+			const emoji = CHANGE_EMOJIS[i] ?? "🏅";
+
+			// Format dates as M/D
+			const fmtDate = (dateStr: string): string => {
+				const d = new Date(`${dateStr}T00:00:00Z`);
+				if (!Number.isFinite(d.getTime())) return dateStr;
+				return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
+			};
+
+			let changeStr: string;
+			if (theme.sortBy === "change_amount") {
+				const sign = changeAmount >= 0 ? "+" : "-";
+				changeStr = `${sign}${formatNumber(Math.abs(changeAmount))}円`;
+			} else {
+				const sign = changePct >= 0 ? "+" : "";
+				changeStr = `${sign}${changePct.toFixed(1)}%`;
+			}
+
+			const periodStr = `${fmtDate(pastDate)}→${fmtDate(currentDate)}`;
+			const priceStr = `${formatNumber(pastPrice)}円→${formatNumber(currentPrice)}円`;
+
+			lines.push(`${emoji} ${cardName}`);
+			lines.push(`${priceStr}（${periodStr} ${changeStr}）`);
+		}
 	}
 
 	lines.push("");
@@ -4646,8 +4779,8 @@ async function runPriceRanking(
 	const theme = getDailyRankingTheme(jstNow);
 
 	// Apply character filter if theme requires
-	const filteredWatchlist = theme.characterFilter
-		? filterWatchlistByCharacter(watchlist, theme.characterFilter)
+	const filteredWatchlist = theme.char
+		? filterWatchlistByCharacter(watchlist, theme.char)
 		: watchlist;
 
 	if (filteredWatchlist.length === 0) {
@@ -4658,7 +4791,24 @@ async function runPriceRanking(
 
 	const rankingEntries = buildRankingEntries(filteredWatchlist, theme, jstNow);
 	const sorted = sortRankingEntries(rankingEntries, theme);
-	const top3 = sorted.slice(0, 3);
+
+	// Dedup: exclude cards posted in the last 7 days, fall back to 3d, 1d if needed
+	let top3: RankingEntry[] = [];
+	for (const dedupDays of [7, 3, 1]) {
+		const recentKeys = await getRecentlyPostedCardKeys(stateStore, dedupDays);
+		const deduped = sorted.filter((e) => {
+			const key = e.entry.cardId || e.entry.cardName || e.entry.card;
+			return !recentKeys.has(key);
+		});
+		if (deduped.length >= 3) {
+			top3 = deduped.slice(0, 3);
+			break;
+		}
+	}
+	// If still not enough after all dedup windows, fall back to original sorted
+	if (top3.length < 3) {
+		top3 = sorted.slice(0, 3);
+	}
 
 	if (top3.length < 3) {
 		const result = {
@@ -4676,6 +4826,10 @@ async function runPriceRanking(
 
 	const message = buildPriceRankingMessage(top3, theme, jstNow);
 
+	// Fetch official card image for the top card
+	const topCardName = top3[0].entry.cardName || top3[0].entry.card || "";
+	const cardImageUrl = await fetchOfficialCardImage(topCardName);
+
 	let postedToX = false;
 	let committed = false;
 	let xResponse: unknown = null;
@@ -4687,24 +4841,30 @@ async function runPriceRanking(
 			const key = `pending_post:${crypto.randomUUID()}`;
 			const pending: PendingPost = {
 				message,
-				mainImageUrl: null,
+				mainImageUrl: cardImageUrl,
 				lastOneImageUrl: null,
 				source: "price_ranking",
 				createdAt: new Date().toISOString(),
 			};
 			await env.STATE.put(key, JSON.stringify(pending), { expirationTtl: PENDING_POST_TTL_SECONDS });
 			const approveUrl = `https://tcgstore-x.harukaoda15.workers.dev/approve?key=${key}&token=${env.APPROVE_SECRET_TOKEN}`;
+			const imageNote = cardImageUrl ? `\n🖼️ 画像: ${cardImageUrl}` : "";
 			await sendTelegram(
-				`📊 相場ランキングプレビュー\n\n${message}\n\n---\n✅ 承認する場合はこちら:\n${approveUrl}\n\n⏰ 2時間以内に承認してください`,
+				`📊 相場ランキングプレビュー\n\n${message}${imageNote}\n\n---\n✅ 承認する場合はこちら:\n${approveUrl}\n\n⏰ 2時間以内に承認してください`,
 				env,
 			);
 			pendingKey = key;
 			telegramNotified = true;
 		} else {
-			const postResult = await postTweetWithImages(message, { mainImageUrl: null, lastOneImageUrl: null }, env);
+			const postResult = await postTweetWithImages(message, { mainImageUrl: cardImageUrl, lastOneImageUrl: null }, env);
 			postedToX = postResult.ok;
 			xResponse = postResult;
 			committed = postResult.ok;
+		}
+
+		// Record posted cards for dedup
+		if (committed || telegramNotified) {
+			await savePostedRankingCards(stateStore, top3.map((e) => e.entry));
 		}
 	}
 
@@ -4719,6 +4879,7 @@ async function runPriceRanking(
 		filteredCount: filteredWatchlist.length,
 		rankingCount: rankingEntries.length,
 		top3Count: top3.length,
+		cardImageUrl,
 		previewMessage: message,
 		pendingKey,
 		telegramNotified,
@@ -5369,6 +5530,133 @@ function stripTags(str: string): string {
 		.replace(/<[^>]+>/g, " ")
 		.replace(/&nbsp;/g, " ")
 		.replace(/&amp;/g, "&");
+}
+
+function buildFreshPriceRankingMessage(
+	top3: Array<{ name: string; currentPrice: number }>,
+	jstDate: Date,
+): string {
+	const MEDALS = ["🥇", "🥈", "🥉"] as const;
+	const month = jstDate.getUTCMonth() + 1;
+	const day = jstDate.getUTCDate();
+	const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"] as const;
+	const dow = jstDate.getUTCDay();
+	const dateLabel = `${month}/${day}(${WEEKDAY_LABELS[dow]})`;
+
+	const lines: string[] = [`【${dateLabel}ポケカ相場】`, "今日の高額カードTOP3"];
+
+	for (let i = 0; i < top3.length; i++) {
+		const medal = MEDALS[i] ?? "🏅";
+		lines.push("");
+		lines.push(`${medal} ${compactCardLabel(top3[i].name)}`);
+		const sourceSuffix = i === 0 ? "（snkrdunk調べ）" : "";
+		lines.push(`${formatNumber(top3[i].currentPrice)}円${sourceSuffix}`);
+	}
+
+	lines.push("");
+	lines.push("#ポケカ");
+	return lines.join("\n");
+}
+
+async function runFreshPriceRanking(
+	env: MonitorEnv,
+	options: { commit?: boolean; logToConsole?: boolean } = {},
+): Promise<Record<string, unknown>> {
+	const { commit = false, logToConsole = true } = options;
+
+	// Hardcoded popular cards with verified snkrdunk apparel URLs
+	// (ミュウex / リザードンex SAR / ナンジャモ SAR are excluded as they are fixed watchlist cards)
+	const POPULAR_CARDS: Array<{ name: string; url: string }> = [
+		{ name: "ピカチュウex UR", url: "https://snkrdunk.com/apparels/469638" },
+		{ name: "フシギバナex SAR", url: "https://snkrdunk.com/apparels/128116" },
+		{ name: "ブラストイズex SAR", url: "https://snkrdunk.com/apparels/128118" },
+		{ name: "ザップex SAR", url: "https://snkrdunk.com/apparels/128120" },
+		{ name: "イーブイex SAR", url: "https://snkrdunk.com/apparels/469630" },
+		{ name: "ラティアスex SAR", url: "https://snkrdunk.com/apparels/358115" },
+	];
+
+	type CardWithPrice = { name: string; currentPrice: number; imageUrl: string | null };
+
+	const settled = await Promise.allSettled(
+		POPULAR_CARDS.map(async (card) => {
+			const page = await fetchPriceSpikeSourcePage(card.url);
+			const price = extractSnkrdunkApparelPrice(page.html);
+			if (!price || price <= 0) throw new Error(`no price for ${card.name}`);
+			const pageOrigin = new URL(page.finalUrl || card.url).origin;
+			const ogImage = normalizeWatchImageUrl(extractOgImageUrl(page.html, pageOrigin), "snkrdunk");
+			return { name: card.name, currentPrice: price, imageUrl: ogImage } satisfies CardWithPrice;
+		}),
+	);
+
+	const cardPrices: CardWithPrice[] = settled
+		.filter((r): r is PromiseFulfilledResult<CardWithPrice> => r.status === "fulfilled")
+		.map((r) => r.value);
+
+	cardPrices.sort((a, b) => b.currentPrice - a.currentPrice);
+	const top3 = cardPrices.slice(0, 3);
+
+	if (top3.length < 3) {
+		const result = { ok: false, reason: "not_enough_cards", cardCount: top3.length };
+		if (logToConsole) console.log(JSON.stringify({ type: "FRESH_PRICE_RANKING_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const jstNow = getJstNow();
+	const message = buildFreshPriceRankingMessage(top3, jstNow);
+	const cardImageUrl = top3[0].imageUrl ?? (await fetchOfficialCardImage(top3[0].name));
+
+	let postedToX = false;
+	let committed = false;
+	let xResponse: unknown = null;
+	let pendingKey: string | undefined;
+	let telegramNotified = false;
+
+	if (commit) {
+		if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && env.STATE) {
+			const key = `pending_post:${crypto.randomUUID()}`;
+			const pending: PendingPost = {
+				message,
+				mainImageUrl: cardImageUrl,
+				lastOneImageUrl: null,
+				source: "fresh_price_ranking",
+				createdAt: new Date().toISOString(),
+			};
+			await env.STATE.put(key, JSON.stringify(pending), { expirationTtl: PENDING_POST_TTL_SECONDS });
+			const approveUrl = `https://tcgstore-x.harukaoda15.workers.dev/approve?key=${key}&token=${env.APPROVE_SECRET_TOKEN}`;
+			const imageNote = cardImageUrl ? `\n🖼️ 画像: ${cardImageUrl}` : "";
+			await sendTelegram(
+				`📊 今日の高額カードランキングプレビュー\n\n${message}${imageNote}\n\n---\n✅ 承認する場合はこちら:\n${approveUrl}\n\n⏰ 2時間以内に承認してください`,
+				env,
+			);
+			pendingKey = key;
+			telegramNotified = true;
+		} else {
+			const postResult = await postTweetWithImages(
+				message,
+				{ mainImageUrl: cardImageUrl, lastOneImageUrl: null },
+				env,
+			);
+			postedToX = postResult.ok;
+			xResponse = postResult;
+			committed = postResult.ok;
+		}
+	}
+
+	const result = {
+		ok: true,
+		commitMode: commit,
+		committed,
+		postedToX,
+		cardCount: cardPrices.length,
+		top3Names: top3.map((c) => c.name),
+		cardImageUrl,
+		previewMessage: message,
+		pendingKey,
+		telegramNotified,
+		xResponse,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "FRESH_PRICE_RANKING_RESULT", ...result }, null, 2));
+	return result;
 }
 
 function jsonResponse(data: unknown): Response {
