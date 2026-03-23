@@ -14,14 +14,21 @@
 		"nodejs_compat"
 	],
 	"triggers": {
-		"crons": ["*/30 * * * *", "0 3 * * *", "0 12 * * *"]
+		"crons": ["*/10 * * * *", "0 3 * * *", "0 9 * * *", "0 12 * * *"]
 	},
 	"kv_namespaces": [
 		{
 			"binding": "STATE",
 			"id": "ff0e72f9774e4a1495a6deab194fd371"
 		}
-	]
+	],
+	// R2 image archive (optional)
+	// "r2_buckets": [
+	// 	{
+	// 		"binding": "POKECA_IMAGE_ARCHIVE",
+	// 		"bucket_name": "tcgstore-pokeca-images"
+	// 	}
+	// ]
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

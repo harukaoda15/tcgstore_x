@@ -1,6 +1,6 @@
 # tcgstore-x 仕様書
 
-最終更新: 2026-03-17
+最終更新: 2026-03-19
 
 ## 更新ルール
 
@@ -14,42 +14,51 @@
 - 永続化: Cloudflare KV（`STATE`）
 - 投稿先: X (Twitter)
 - AI生成: Anthropic Claude API
+- 外部監視: openclaw cron（`price_spike` の送信元）
 
 ## 現在の運用戦略（要点）
 
 - 目的は「広告感の強い定型投稿」ではなく、読み手の判断材料になる投稿を継続すること。
 - 自社商品紹介daily（`TCG STORE` / `メルカリくじ`）は一時停止し、コードはフラグで残す。
 - `price_spike` で動いたカードを KV `watchlist` に自動追加し、7日無更新で自動除外する。
-- 毎日21:00 JSTに `watchlist` から市場まとめ投稿を1本出す（URLなし / #ポケカ のみ）。
+- `price_spike` は Worker 自身が全件監視するのではなく、openclaw 側の差分監視が Webhook 送信する構成。
+- 毎日21:00 JSTのポケカサマリーは、Worker が `pokeca-chart.com` を直接スクレイピングして取得。sitemap からカードURLを取得し、各ページから価格・画像を抽出。KV に日次蓄積。
 - 文面は「数字を具体的に」「上昇/下落を明示」「煽り/断定/予測なし」を基本方針とする。
+- 初期公開は AI なしの固定テンプレ投稿で開始し、公開件数は `上位10件`、内部蓄積は `上位50件` を基本とする。
+- 投稿頻度はまず `1日1回` とし、引用元 URL と取得日時を本文に明記する。
+- 画像は `上位3枚` を投稿添付し、alt にはカード名を設定する。
+- 長期分析用に画像本体を残す場合は `R2` を使い、KV には `imageR2Key` を保存する。
 
 ## 実行スケジュール
 
-- `*/30 * * * *`
-  - しきい値監視（メルカリくじ: 10%/5%、TCG STORE: 5%/1%）
+- `*/10 * * * *`
+  - しきい値監視の実行枠
+  - 基本は30分ごとに監視（UTC分が `00` / `30` の回）
+  - どちらかのソースで「残り200回以下」が検出された後は、一定時間だけ10分間隔監視を有効化
 - `0 3 * * *`（JST 12:00）
   - 追加投稿なし（自社商品dailyは停止中）
 - `0 11 * * *`（JST 20:00）
-  - watchlist価格更新（`sourceUrl` 再取得で currentPrice / imageUrl を更新）
+  - `wrangler.jsonc` の cron 未登録のため、現在は自動実行されていない
 - `0 12 * * *`（JST 21:00）
-  - 市場まとめ投稿（watchlistベース）
+  - ポケカサマリー投稿（`ENABLE_POKECA_SUMMARY_DAILY` 時）
+  - または市場まとめ投稿（`ENABLE_MARKET_SUMMARY_DAILY` 時、データ不足時はスキップ）
 
 ## 機能1: しきい値監視（ソース別）
 
-- 判定対象: 取得データの残数/総数から算出した割合
+- 判定対象: メルカリくじ / TCG STORE ともに残回数（絶対回数）
 - 対象ソース: `メルカリくじ` と `TCG STORE` の両方
 - メルカリくじ:
-  - 10%以下: `🎯` テンプレート
-  - 5%以下: `🚨` テンプレート
+  - 残り200回以下: `🎯` テンプレート
+  - 残り100回以下: `🚨` テンプレート
 - TCG STORE:
-  - 5%以下: `🎯` テンプレート
-  - 1%以下: `🚨` テンプレート
+  - 残り200回以下: `🎯` テンプレート
+  - 残り100回以下: `🚨` テンプレート
 - しきい値投稿済みフラグを KV で管理し、重複投稿を防止
 - ラスト賞画像がない商品は、ラスト賞訴求行を自動で省略
-- メルカリくじの文体は「孤高のラッパー」トーン（静か・冷たい・少し挑発的）
-  - 短文中心、過剰説明しない
-  - `😮‍💨 😏 👀 🫥 👁️ 😶‍🌫️ 🫠 🫰` を少数使用
-  - 安直な煽り語（例: 焦れ/急げ/爆アツ）は使わない
+- メルカリくじの文体は通常トーン（事実ベース・簡潔）
+  - 残回数と全体回数を明示
+  - 行き過ぎた煽り・挑発的な表現は使わない
+  - 絵文字は必要最小限（`🎯` / `🚨` / `🏆`）
 - 直近 `price_spike` 情報（72時間以内）を参照し、タイトルとカード名が一致する場合のみ価格スパイク行を追記
   - 追記形式: `📈 {カード名}: {前回価格}円 → {現在価格}円（+{変化率}%）`
   - 価格変化が弱い場合（`change_pct < 8`）は購買意欲を下げるため追記しない
@@ -68,6 +77,8 @@
   - 最後の検出から7日経過したカードは自動除外
   - 上限20件（新しい順）
   - `source_url` から `og:image` を抽出し `imageUrl` として保存
+  - 市場まとめで採用する対象は `pokeca-chart` ソースのみ（PSA相場）
+  - `snkrdunk` 由来や外部出品写真は市場まとめに使わない
 - 投稿スタイル:
   - 1行目: `【M/D(曜)テーマ名】`
   - 曜日テーマを切替:
@@ -87,9 +98,36 @@
   - URLなし
   - ハッシュタグは `#ポケカ` 1つのみ
   - 煽り・断定・予測は禁止
-  - 画像は watchlist の `imageUrl` から最大3枚添付
+  - 画像は `pokeca-chart` 由来の `imageUrl` から最大3枚添付（外部出品写真は使用しない）
   - AIモデルは `MARKET_SUMMARY_MODEL` を優先（未設定時は低コストモデル）
   - `MARKET_SUMMARY_USE_AI=false` の場合はテンプレフォールバック投稿
+  - 変化量データが薄い日（有意な変動が3件未満）は投稿をスキップ（不正確なランキングを出さない）
+  - 現在は `pokeca-chart` 全件蓄積が未実装のため、スキップが起こりうる
+
+## 機能2b: ポケカサマリーdaily（21:00 JST）【Web2ポケカサマリー】
+
+詳細: [web2-pokeca-summary.md](./web2-pokeca-summary.md)
+
+- データ元: `pokeca-chart.com` を Worker が直接取得
+- 取得方法: `pokeca-chart` のランキング描画と同一系統データソースから `rank_rise_7` を取得
+- KV 蓄積: `pokeca_summary:{YYYY-MM-DD}:{rankTarget}` に当日分を保存
+- 画像アーカイブ（任意）: `POKECA_IMAGE_ARCHIVE` バインディングがある場合、`pokeca-summary/{YYYY-MM-DD}/...` に画像保存
+- 実行時刻:
+  - 18:00 JST: 取得して日次スナップショット保存
+  - 21:00 JST: 保存済みスナップショットから投稿
+- 投稿形式: `【ポケカ相場急騰ウォッチ TOPN】` + フルネーム + 価格 + `#ポケカ`、画像最大3枚
+- 件数制御:
+  - `TOP10 -> TOP8 -> TOP5` の順で自動縮小
+- 現在テーマ:
+  - `rank_rise_7` 固定
+- 手動: `/?mode=pokeca_summary_preview`（プレビュー）、`/?mode=pokeca_summary&commit=1`（実投稿）
+
+## 機能2補足: 今後の市場まとめ方針
+
+- 目標は `pokeca-chart` 全件の現在価格を毎日取得してKVへ蓄積すること
+- 3日以上データが溜まったら、直近3日ランキング / 7日ランキングに拡張する
+- 画像は `pokeca-chart` もしくは将来的に公式画像のみ使用する
+- 価格スパイク通知と市場まとめ基盤は分離して考える
 
 ## 機能3: TCG STORE daily 紹介（AI）【停止中】
 
@@ -262,18 +300,51 @@
   - `/?mode=price_spike`（POST JSON / `commit` なし）
 - price_spike 実投稿:
   - `/?mode=price_spike&commit=1`（POST JSON）
+- price_spike 監査ログ確認:
+  - `/?mode=price_spike_audit&limit=30`
 
 ## 機能5: price_spike 投稿
 
+- `price_spike` の監視自体は Worker 内では行わない
+- 外部送信元は openclaw cron:
+  - `pokeca-chart.com` 上位カードの前回差分監視
+- ローカルキャッシュ（`~/.openclaw/cache/pokeca-prices.json`）と比較してスパイク判定する
+- 比較対象は「前回実行時との差」であり、厳密な前日比ではない
+- 役割は市場全体ランキングではなく「リアルタイム寄りの変動通知」
 - リクエストJSON:
   - `source: string`
-  - `spikes: [{ card, variant?, card_id?, before, after, change_pct, fetched_at, period?, source_site?, source_url? }]`
+  - `spikes: [{ card, variant?, card_id?, before, after, change_pct, previous_fetched_at?, fetched_at, period?, source_site?, source_url? }]`
+- openclaw 送信例:
+  ```json
+  {
+    "source": "pokeca-chart",
+    "spikes": [
+      {
+        "card": "リザードンex SAR SV3 134/108",
+        "variant": "SAR SV3 134/108",
+        "card_id": "sv3-134-108",
+        "before": 35800,
+        "after": 44800,
+        "change_pct": 25,
+        "previous_fetched_at": "2026-03-18T12:00:00Z",
+        "fetched_at": "2026-03-19T00:00:00Z",
+        "source_site": "pokeca-chart",
+        "source_url": "https://pokeca-chart.com/cardlist/pokemon-card-games/sv3/cards/sv3-134-108/"
+      }
+    ]
+  }
+  ```
+- openclaw 側の注意:
+  - `previous_fetched_at` は前回比較元の取得時刻をそのまま送る
+  - `fetched_at` は今回取得時刻を送る
+  - Worker は `fetched_at - previous_fetched_at <= 24時間` の時だけ `24時間以内のトレンドを確認。` を本文へ追加する
+  - `source_site` と `source_url` が無い場合は投稿拒否になる
 - `spikes` の先頭1件のみ処理
 - 成功時は KV `watchlist` を更新（新規追加 / `firstSeenAt`・`lastSeenAt` 更新 / 7日失効データを除外）
 - `source_url` ページから `og:image` を抽出し、`watchlist.imageUrl` に保存
 - 入力バリデーション（厳格）:
-  - 参照サイトは `snkrdunk` / `pokeca-chart` のみ許可
-  - `source_url` は必須（対応サイトのURLのみ許可）
+  - `source_site` は `pokeca-chart` のみ許可
+  - `source_url` は必須（`pokeca-chart` 対応URLのみ許可）
   - `variant` / `card_id` が不足している場合は `source_url` のページを取得してカード識別情報を補完
   - 補完は「カード名の近傍テキストで識別子が一意に取れた場合のみ」実施（曖昧なら投稿拒否）
   - カード識別子（`card_id`）または型番・収録番号等を含む `variant` が無い場合は投稿拒否
@@ -282,17 +353,32 @@
   - KVキー `price_spike:{source}:{card_id or canonical_card_name}`
   - 既に存在する場合は `skipped: true` で終了
   - 実投稿成功時のみTTL 21600秒（6時間）で記録
+- 監査ログ:
+  - 全リクエストの処理結果（validation失敗 / duplicate skip / X投稿失敗など）をKVに保存
+  - `price_spike_audit` エンドポイントから直近履歴を確認できる
 - 投稿文:
   - デフォルトはテンプレ固定（AI不使用）
   - `PRICE_SPIKE_USE_AI=true` の場合のみ Anthropic 生成を使用
   - 構成:
-    - 1行目: `カード名`
-    - 2行目: `{前回価格}円 → {現在価格}円（{period} ±{変化率}%）`
-    - 3行目: `#ポケカ`
+    - 1行目: `💣価格スパイク速報🔥`
+    - 2行目: 空行
+    - 3行目: `【カード名】`
+    - 4行目: 空行
+    - 5行目: `M/D〜M/D`
+    - 6行目: 空行
+    - 7行目: `{前回価格}円 → {現在価格}円（±{変化率}%）`
+    - 8行目: 空行
+    - 9行目: `previous_fetched_at` から `fetched_at` が24時間以内の時だけ `24時間以内のトレンドを確認。`
+    - 10行目: 空行（9行目がある時のみ）
+    - 11行目: `#ポケカ`
     - URLは付与しない（市場情報のみ）
   - `#ポケカ` 固定
-  - 60〜100文字
+  - 改行を多めにして読みやすくする
+  - 60〜120文字
   - 煽り/主観/根拠なし予測を禁止
+- 画像:
+  - `pokeca-chart` の `source_url` から取得した `og:image` がある場合のみ添付
+  - 画像altは `カード名 | 現在価格円（前回比+X%）` 形式
 
 ## 必要な環境変数/Secrets
 
@@ -309,4 +395,3 @@
   - `MARKET_SUMMARY_MODEL`（市場まとめ用。未設定時は低コストモデル）
   - `MARKET_SUMMARY_USE_AI`（true/false、既定true）
   - `PRICE_SPIKE_USE_AI`（true/false、既定false）
-

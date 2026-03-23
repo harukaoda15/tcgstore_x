@@ -44,6 +44,7 @@ type PriceSpikeItem = {
 	before: number;
 	after: number;
 	change_pct: number;
+	previous_fetched_at?: string;
 	fetched_at: string;
 	period?: string;
 	source_site?: string;
@@ -56,6 +57,37 @@ type PriceSpikeItem = {
 type PriceSpikePayload = {
 	source: string;
 	spikes: PriceSpikeItem[];
+};
+
+type PokecaSummaryCard = {
+	cardName: string;
+	price: number;
+	imageUrl: string | null;
+	imageR2Key?: string | null;
+	url: string;
+	fetchedAt: string;
+};
+
+type PokecaRankTarget = "rank_rise_7" | "rank_fall_7" | "rank_vol";
+
+type PokecaSummarySnapshot = {
+	rankTarget: PokecaRankTarget;
+	cards: PokecaSummaryCard[];
+	apiItemCount: number;
+	snapshotFetchedAt: string;
+};
+
+type PokecaApiPriceInfo = {
+	nPriceRecent?: number;
+	fRiseFallRate7?: number;
+};
+
+type PokecaApiItem = {
+	strSlug?: string;
+	strName?: string;
+	strImgUrl?: string;
+	nVolume?: number;
+	arrayPriceInfo?: Record<string, PokecaApiPriceInfo>;
 };
 
 type WatchlistEntry = {
@@ -133,6 +165,7 @@ type PickedTitle = {
 
 type MonitorEnv = Env & {
 	STATE?: KVNamespace;
+	POKECA_IMAGE_ARCHIVE?: R2Bucket;
 	X_API_KEY?: string;
 	X_API_KEY_SECRET?: string;
 	X_ACCESS_TOKEN?: string;
@@ -142,6 +175,7 @@ type MonitorEnv = Env & {
 	PRICE_SPIKE_USE_AI?: string;
 	MARKET_SUMMARY_USE_AI?: string;
 	MARKET_SUMMARY_MODEL?: string;
+	POKECA_ARCHIVE_IMAGES?: string;
 };
 
 type StateStore = {
@@ -156,19 +190,36 @@ const TCGSTORE_RECENT_URLS_KEY = "recent_oripa_urls";
 const MERCARI_RECENT_URLS_KEY = "recent_mercari_urls";
 const DAILY_LAST_SOURCE_KEY = "last_daily_source";
 const LATEST_MARKET_CONTEXT_KEY = "latest_market_context";
+const PRICE_SPIKE_AUDIT_KEY = "price_spike_audit";
+const FAST_MONITOR_UNTIL_KEY = "fast_monitor_until";
+const POKECA_SUMMARY_DAILY_PREFIX = "pokeca_summary:";
+const POKECA_CHART_API_URL = "https://pokeca-chart.com/ch/api/v1/item";
+const POKECA_CHART_URL_ORIGIN = "https://pokeca-chart.com/";
+const POKECA_CHART_PASS_PHRASE_HEAD = "vQpUc4ej";
+const POKECA_POST_RANK_LIMIT = 10;
+const POKECA_SNAPSHOT_TOP_LIMIT = 50;
+const POKECA_SNAPSHOT_RANK_TARGETS: PokecaRankTarget[] = ["rank_rise_7", "rank_fall_7", "rank_vol"];
+const POKECA_POST_IMAGE_LIMIT = 3;
+const POKECA_TWEET_TEXT_LIMIT = 280;
+const POKECA_SUMMARY_RETENTION_DAYS = 90;
 const DAILY_RECENT_HISTORY_LIMIT = 10;
 const ALERT_MARKET_CHANGE_PCT_MIN = 8;
-const ALERT_THRESHOLDS: Record<MonitorSource, { low: number; high: number }> = {
-	mercari: { low: 10, high: 5 },
-	tcgstore: { low: 5, high: 1 },
+const FAST_MONITOR_WINDOW_MS = 1000 * 60 * 90;
+const ALERT_THRESHOLDS: Record<MonitorSource, { low: number; high: number; unit: "percent" | "count" }> = {
+	mercari: { low: 200, high: 100, unit: "count" },
+	tcgstore: { low: 200, high: 100, unit: "count" },
 };
 const WATCHLIST_KEY = "watchlist";
 const WATCHLIST_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const WATCHLIST_LIMIT = 20;
+const MARKET_SUMMARY_MIN_POOL = 3;
+const SNKRDUNK_SEED_FALLBACK_IDS: string[] = [];
 const DAILY_SPOTLIGHT_ENABLED = false;
 const ENABLE_TCG_DAILY_SPOTLIGHT = false;
 const ENABLE_MERCARI_DAILY_SPOTLIGHT = false;
-const ENABLE_MARKET_SUMMARY_DAILY = true;
+const ENABLE_MARKET_SUMMARY_DAILY = false;
+const ENABLE_POKECA_SUMMARY_DAILY = true;
+const ENABLE_POKECA_THEME_AUTOMATION = true;
 const DAILY_AI_PATTERN_ORDER: DailyAiPattern[] = [
 	"market_analysis",
 	"contrarian",
@@ -241,6 +292,7 @@ const MARKET_SUMMARY_SYSTEM_PROMPT = `あなたはポケカ市場情報を簡潔
 - 3〜5件まとめる
 - 煽り・断定・予測禁止`;
 const DEFAULT_MARKET_SUMMARY_MODEL = "claude-3-5-haiku-latest";
+const PRICE_SPIKE_AUDIT_LIMIT = 100;
 
 const MERCARI_DAILY_AI_SYSTEM_PROMPT = `あなたはTCGSTOREのX運用担当。
 メルカリくじの紹介投稿を作るが、広告っぽさよりも「読む価値」を優先する。
@@ -311,6 +363,13 @@ export default {
 			const result = await runPriceSpikeMode(request, env, { commit, logToConsole: true });
 			return jsonResponse(result);
 		}
+		if (mode === "price_spike_audit") {
+			const stateStore = createStateStore(env);
+			const limitRaw = Number(reqUrl.searchParams.get("limit") ?? "30");
+			const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, Math.trunc(limitRaw))) : 30;
+			const audit = await getPriceSpikeAudit(stateStore, limit);
+			return jsonResponse({ ok: true, total: audit.length, audit });
+		}
 		if (mode === "market_summary") {
 			const commit = reqUrl.searchParams.get("commit") === "1";
 			const result = await runMarketSummary(env, {
@@ -328,6 +387,55 @@ export default {
 			});
 			return jsonResponse(result);
 		}
+		if (mode === "pokeca_summary") {
+			const commit = reqUrl.searchParams.get("commit") === "1";
+			const rank = reqUrl.searchParams.get("rank");
+			const imagesParam = reqUrl.searchParams.get("images");
+			const imageLimit =
+				imagesParam == null
+					? undefined
+					: Math.max(0, Math.min(3, Math.trunc(Number(imagesParam))));
+			const result = await runPokecaSummary(env, {
+				commit,
+				rank,
+				imageLimit,
+				logToConsole: true,
+				fromSchedule: false,
+			});
+			return jsonResponse(result);
+		}
+		if (mode === "pokeca_summary_preview") {
+			const rank = reqUrl.searchParams.get("rank");
+			const imagesParam = reqUrl.searchParams.get("images");
+			const imageLimit =
+				imagesParam == null
+					? undefined
+					: Math.max(0, Math.min(3, Math.trunc(Number(imagesParam))));
+			const result = await runPokecaSummary(env, {
+				commit: false,
+				rank,
+				imageLimit,
+				logToConsole: true,
+				fromSchedule: false,
+				preferStoredSnapshot: true,
+				persistFetchedSnapshot: false,
+			});
+			return jsonResponse(result);
+		}
+		if (mode === "pokeca_summary_sample") {
+			const sample = buildPokecaSummarySample();
+				return jsonResponse({
+					ok: true,
+					mode: "pokeca_summary_sample",
+					note: "X APIは使用しません。投稿フォーマットのサンプルです。",
+					previewMessage: sample,
+					schedule: "毎日 18:00 JST 取得 / 21:00 JST 投稿（cron: 0 9 * * * / 0 12 * * *）",
+				});
+			}
+		if (mode === "pokeca_summary_debug") {
+			const result = await runPokecaSummaryDebug();
+			return jsonResponse(result);
+		}
 
 		return runMonitor(request, env, {
 			fromSchedule: false,
@@ -341,11 +449,29 @@ export default {
 		env: MonitorEnv,
 		_ctx: ExecutionContext,
 	): Promise<void> {
-		await runMonitor(new Request("https://scheduled.local/?commit=1"), env, {
-			fromSchedule: true,
-			forceCommit: true,
-			logToConsole: true,
-		});
+		const stateStore = createStateStore(env);
+		const currentMinuteUtc = new Date(event.scheduledTime).getUTCMinutes();
+		const isThirtyMinuteTick = currentMinuteUtc % 30 === 0;
+		const isFastWindowActive = await isFastMonitorWindowActive(stateStore);
+		if (isThirtyMinuteTick || isFastWindowActive) {
+			const monitorResponse = await runMonitor(new Request("https://scheduled.local/?commit=1"), env, {
+				fromSchedule: true,
+				forceCommit: true,
+				logToConsole: true,
+			});
+			if (isThirtyMinuteTick) {
+				try {
+					const monitorResult = (await monitorResponse.clone().json()) as { fastMonitorNeeded?: boolean };
+					if (monitorResult.fastMonitorNeeded) {
+						await enableFastMonitorWindow(stateStore);
+					} else {
+						await disableFastMonitorWindow(stateStore);
+					}
+				} catch {
+					// keep previous fast-monitor window state when response parse fails
+				}
+			}
+		}
 		if (DAILY_SPOTLIGHT_ENABLED && isDailySpotlightCron(event)) {
 			await runDailyRandomSpotlight(env, {
 				commit: true,
@@ -356,7 +482,20 @@ export default {
 		if (event.cron === "0 11 * * *") {
 			await refreshWatchlistPrices(env, { logToConsole: true });
 		}
-		if (isMarketSummaryCron(event) && ENABLE_MARKET_SUMMARY_DAILY) {
+		if (isPokecaSummaryFetchCron(event) && ENABLE_POKECA_SUMMARY_DAILY) {
+			await runPokecaSummaryDailySnapshotFetch(env, {
+				logToConsole: true,
+				fromSchedule: true,
+			});
+		}
+		if (isPokecaSummaryPostCron(event) && ENABLE_POKECA_SUMMARY_DAILY) {
+			await runPokecaSummary(env, {
+				commit: true,
+				logToConsole: true,
+				fromSchedule: true,
+				preferStoredSnapshot: true,
+			});
+		} else if (isPokecaSummaryPostCron(event) && ENABLE_MARKET_SUMMARY_DAILY) {
 			await runMarketSummary(env, {
 				commit: true,
 				logToConsole: true,
@@ -365,6 +504,22 @@ export default {
 		}
 	},
 };
+
+async function isFastMonitorWindowActive(stateStore: StateStore): Promise<boolean> {
+	const raw = await stateStore.get(FAST_MONITOR_UNTIL_KEY);
+	if (!raw) return false;
+	const until = new Date(raw);
+	return Number.isFinite(until.getTime()) && until.getTime() > Date.now();
+}
+
+async function enableFastMonitorWindow(stateStore: StateStore): Promise<void> {
+	const until = new Date(Date.now() + FAST_MONITOR_WINDOW_MS).toISOString();
+	await stateStore.put(FAST_MONITOR_UNTIL_KEY, until);
+}
+
+async function disableFastMonitorWindow(stateStore: StateStore): Promise<void> {
+	await stateStore.put(FAST_MONITOR_UNTIL_KEY, "");
+}
 
 async function runDailyTcgStoreSpotlight(
 	env: MonitorEnv,
@@ -530,8 +685,60 @@ function isDailySpotlightCron(event: ScheduledEvent): boolean {
 	return event.cron === "0 3 * * *";
 }
 
-function isMarketSummaryCron(event: ScheduledEvent): boolean {
+function isPokecaSummaryFetchCron(event: ScheduledEvent): boolean {
+	return event.cron === "0 9 * * *";
+}
+
+function isPokecaSummaryPostCron(event: ScheduledEvent): boolean {
 	return event.cron === "0 12 * * *";
+}
+
+async function runPokecaSummaryDailySnapshotFetch(
+	env: MonitorEnv,
+	options: { logToConsole?: boolean; fromSchedule?: boolean } = {},
+): Promise<Record<string, unknown>> {
+	const { logToConsole = true, fromSchedule = false } = options;
+	const items = await fetchPokecaApiItems();
+	if (items.length === 0) {
+		const result = {
+			ok: false,
+			reason: "pokeca_snapshot_fetch_failed",
+			fromSchedule,
+			fetchedItems: 0,
+			ranks: [],
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "POKECA_SUMMARY_FETCH_BATCH", ...result }, null, 2));
+		return result;
+	}
+	const rankResults: Array<Record<string, unknown>> = [];
+	for (const rankTarget of POKECA_SNAPSHOT_RANK_TARGETS) {
+		const rankResult = (await runPokecaSummary(env, {
+			commit: false,
+			logToConsole: false,
+			fromSchedule,
+			rank: rankTarget,
+			preferStoredSnapshot: false,
+			persistSnapshotOnly: true,
+			preloadedItems: items,
+		})) as Record<string, unknown>;
+		rankResults.push({
+			rankTarget,
+			ok: Boolean(rankResult.ok),
+			snapshotKey: typeof rankResult.snapshotKey === "string" ? rankResult.snapshotKey : null,
+			snapshotCardCount:
+				typeof rankResult.snapshotCardCount === "number" ? Number(rankResult.snapshotCardCount) : null,
+			reason: typeof rankResult.reason === "string" ? rankResult.reason : null,
+		});
+	}
+	const result = {
+		ok: rankResults.some((r) => r.ok === true),
+		fromSchedule,
+		fetchedItems: items.length,
+		ranks: rankResults,
+		snapshotTopLimit: POKECA_SNAPSHOT_TOP_LIMIT,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "POKECA_SUMMARY_FETCH_BATCH", ...result }, null, 2));
+	return result;
 }
 
 async function runDailyRandomSpotlight(
@@ -605,11 +812,34 @@ async function runPriceSpikeMode(
 		const spikes = Array.isArray(payload?.spikes) ? payload.spikes : [];
 		const rawSpike = spikes[0];
 		const spike = await enrichPriceSpikeIdentity(rawSpike, payload?.source);
+		const stateStore = createStateStore(env);
 		if (!spike || !spike.card) {
+			await appendPriceSpikeAudit(stateStore, {
+				at: new Date().toISOString(),
+				source: normalizePriceSpikeSource(payload?.source) ?? null,
+				card: null,
+				commit,
+				ok: false,
+				skipped: false,
+				postedToX: false,
+				reason: "invalid_payload",
+				xStatus: null,
+			});
 			return { ok: false, error: "invalid_payload", committed: false, postedToX: false, previewMessage: "" };
 		}
 		const inputValidation = validatePriceSpikeInput(spike, payload?.source);
 		if (!inputValidation.ok) {
+			await appendPriceSpikeAudit(stateStore, {
+				at: new Date().toISOString(),
+				source: normalizePriceSpikeSource(spike.source_site ?? payload?.source) ?? null,
+				card: getCanonicalPriceSpikeCardName(spike) || null,
+				commit,
+				ok: false,
+				skipped: false,
+				postedToX: false,
+				reason: inputValidation.reason ?? "validation_failed",
+				xStatus: null,
+			});
 			return {
 				ok: false,
 				error: inputValidation.reason,
@@ -618,7 +848,6 @@ async function runPriceSpikeMode(
 				previewMessage: "",
 			};
 		}
-		const stateStore = createStateStore(env);
 		const watchlist = await upsertWatchlistFromSpike(stateStore, spike, payload?.source);
 		await stateStore.put(
 			LATEST_MARKET_CONTEXT_KEY,
@@ -637,6 +866,17 @@ async function runPriceSpikeMode(
 		const key = `price_spike:${buildPriceSpikeIdentityKey(spike)}`;
 		const already = await stateStore.get(key);
 		if (already) {
+			await appendPriceSpikeAudit(stateStore, {
+				at: new Date().toISOString(),
+				source: normalizePriceSpikeSource(spike.source_site ?? payload?.source) ?? null,
+				card: getCanonicalPriceSpikeCardName(spike) || null,
+				commit,
+				ok: true,
+				skipped: true,
+				postedToX: false,
+				reason: "duplicate_skipped",
+				xStatus: null,
+			});
 			return {
 				ok: true,
 				skipped: true,
@@ -666,10 +906,18 @@ async function runPriceSpikeMode(
 		let committed = false;
 		let xResponse: unknown = null;
 		if (commit) {
+			const source = normalizePriceSpikeSource(spike.source_site ?? payload?.source);
+			const canAttachImage = source === "pokeca-chart";
 			const postResult = await postTweetWithImages(
 				previewMessage,
-				{ mainImageUrl: spike.image_url ?? spike.imageUrl ?? null, lastOneImageUrl: null },
+				{
+					mainImageUrl: canAttachImage ? spike.image_url ?? spike.imageUrl ?? null : null,
+					lastOneImageUrl: null,
+				},
 				env,
+				{
+					mainImageAlt: canAttachImage ? buildPriceSpikeImageAlt(spike) : null,
+				},
 			);
 			postedToX = postResult.ok;
 			xResponse = postResult;
@@ -694,10 +942,36 @@ async function runPriceSpikeMode(
 			watchlistCount: watchlist.length,
 			xResponse,
 		};
+		await appendPriceSpikeAudit(stateStore, {
+			at: new Date().toISOString(),
+			source: normalizePriceSpikeSource(spike.source_site ?? payload?.source) ?? null,
+			card: getCanonicalPriceSpikeCardName(spike) || null,
+			commit,
+			ok: true,
+			skipped: false,
+			postedToX,
+			reason: postedToX || !commit ? null : "x_post_failed",
+			xStatus:
+				typeof (xResponse as { status?: unknown } | null)?.status === "number"
+					? Number((xResponse as { status?: unknown }).status)
+					: null,
+		});
 		if (logToConsole) console.log(JSON.stringify({ type: "PRICE_SPIKE_RESULT", ...result }, null, 2));
 		return result;
 	} catch (error) {
 		console.error("[price_spike] failed", error);
+		const stateStore = createStateStore(env);
+		await appendPriceSpikeAudit(stateStore, {
+			at: new Date().toISOString(),
+			source: null,
+			card: null,
+			commit,
+			ok: false,
+			skipped: false,
+			postedToX: false,
+			reason: error instanceof Error ? error.message : String(error),
+			xStatus: null,
+		});
 		return {
 			ok: false,
 			error: error instanceof Error ? error.message : String(error),
@@ -714,9 +988,18 @@ async function runMarketSummary(
 ): Promise<Record<string, unknown>> {
 	const { commit = false, logToConsole = true, fromSchedule = false } = options;
 	const stateStore = createStateStore(env);
-	const watchlist = await pruneAndPersistWatchlist(stateStore);
+	let watchlist = await pruneAndPersistWatchlist(stateStore);
+	watchlist = watchlist.filter((item) => item.sourceSite === "pokeca-chart");
+	const seeded = 0;
 	if (watchlist.length === 0) {
-		const result = { ok: false, reason: "watchlist_empty", committed: false, postedToX: false, fromSchedule };
+		const result = {
+			ok: false,
+			reason: "watchlist_empty_pokeca_chart_only",
+			committed: false,
+			postedToX: false,
+			fromSchedule,
+			seeded,
+		};
 		if (logToConsole) console.log(JSON.stringify({ type: "MARKET_SUMMARY_SKIP", ...result }, null, 2));
 		return result;
 	}
@@ -724,10 +1007,24 @@ async function runMarketSummary(
 	const theme = getDailyMarketTheme(jstNow);
 	const sorted = sortWatchlistByTheme(watchlist, theme.sortBy, jstNow);
 	const picked = sorted.slice(0, 5);
+	const meaningfulMoves = picked.filter((item) => hasMeaningfulChangeForSummary(item)).length;
+	if (meaningfulMoves < 3) {
+		const result = {
+			ok: false,
+			reason: "market_summary_insufficient_data",
+			meaningfulMoves,
+			watchlistCount: watchlist.length,
+			committed: false,
+			postedToX: false,
+			fromSchedule,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "MARKET_SUMMARY_SKIP", ...result }, null, 2));
+		return result;
+	}
 	if (picked.length < 3) {
 		const result = {
 			ok: false,
-			reason: "watchlist_not_enough_items",
+			reason: "watchlist_not_enough_items_pokeca_chart_only",
 			watchlistCount: watchlist.length,
 			committed: false,
 			postedToX: false,
@@ -766,6 +1063,7 @@ async function runMarketSummary(
 		commitMode: commit,
 		committed,
 		postedToX,
+		seeded,
 		aiUsed: ai.ok,
 		aiReason: ai.reason ?? null,
 		theme,
@@ -828,6 +1126,769 @@ async function refreshWatchlistPrices(
 	const result = { ok: true, updated, total: sorted.length };
 	if (logToConsole) console.log(JSON.stringify({ type: "WATCHLIST_REFRESH", ...result }, null, 2));
 	return result;
+}
+
+function getJstYmd(now = new Date()): string {
+	const jst = getJstNow(now);
+	const y = String(jst.getUTCFullYear());
+	const m = String(jst.getUTCMonth() + 1).padStart(2, "0");
+	const d = String(jst.getUTCDate()).padStart(2, "0");
+	return `${y}-${m}-${d}`;
+}
+
+function parsePokecaRankTarget(raw: string | null | undefined): PokecaRankTarget | null {
+	const value = String(raw ?? "").trim().toLowerCase();
+	if (value === "rank_rise_7" || value === "rise_7") return "rank_rise_7";
+	if (value === "rank_fall_7" || value === "fall_7") return "rank_fall_7";
+	if (value === "rank_vol" || value === "vol") return "rank_vol";
+	return null;
+}
+
+function normalizePokecaRankTarget(raw: string | null | undefined): PokecaRankTarget {
+	return parsePokecaRankTarget(raw) ?? "rank_rise_7";
+}
+
+function getPokecaAutoThemeRankTarget(jstDate: Date): PokecaRankTarget {
+	const dow = jstDate.getUTCDay(); // 0=日, 1=月, ..., 6=土
+	switch (dow) {
+		case 0:
+			return "rank_vol";
+		case 2:
+		case 5:
+			return "rank_vol";
+		case 3:
+		case 6:
+			return "rank_fall_7";
+		default:
+			return "rank_rise_7";
+	}
+}
+
+function resolvePokecaRankTarget(
+	rawRank: string | null | undefined,
+	jstDate: Date,
+): { rankTarget: PokecaRankTarget; rankSource: "param" | "auto_weekday" | "default" } {
+	const parsed = parsePokecaRankTarget(rawRank);
+	if (parsed) {
+		return { rankTarget: parsed, rankSource: "param" };
+	}
+	if (ENABLE_POKECA_THEME_AUTOMATION) {
+		return {
+			rankTarget: getPokecaAutoThemeRankTarget(jstDate),
+			rankSource: "auto_weekday",
+		};
+	}
+	return { rankTarget: "rank_rise_7", rankSource: "default" };
+}
+
+function getPokecaRankLabel(rank: PokecaRankTarget): string {
+	if (rank === "rank_fall_7") return "下落ランキング -フリマ-";
+	if (rank === "rank_vol") return "取引件数ランキング -フリマ-";
+	return "高騰ランキング -フリマ-";
+}
+
+function getPokecaRankSortValue(item: PokecaApiItem, rank: PokecaRankTarget): number {
+	const priceInfo0 = item.arrayPriceInfo?.["0"];
+	if (rank === "rank_fall_7") {
+		const riseFall = Number(priceInfo0?.fRiseFallRate7 ?? Number.POSITIVE_INFINITY);
+		return Number.isFinite(riseFall) ? riseFall : Number.POSITIVE_INFINITY;
+	}
+	if (rank === "rank_vol") {
+		const volume = Number(item.nVolume ?? Number.NEGATIVE_INFINITY);
+		return Number.isFinite(volume) ? volume : Number.NEGATIVE_INFINITY;
+	}
+	const riseFall = Number(priceInfo0?.fRiseFallRate7 ?? Number.NEGATIVE_INFINITY);
+	return Number.isFinite(riseFall) ? riseFall : Number.NEGATIVE_INFINITY;
+}
+
+function getPokecaSummaryPrice(item: PokecaApiItem): number | null {
+	const info = item.arrayPriceInfo?.["0"];
+	const candidates = [info?.nPriceRecent];
+	for (const c of candidates) {
+		const n = Number(c ?? NaN);
+		if (Number.isFinite(n) && n > 0) return n;
+	}
+	return null;
+}
+
+function normalizePokecaCardUrl(slug: string): string {
+	const normalizedSlug = String(slug ?? "").replace(/^\/+|\/+$/g, "");
+	return `${POKECA_CHART_URL_ORIGIN}${normalizedSlug}/`;
+}
+
+function compactPokecaRankCardName(cardName: string, maxLen: number): string {
+	const cleaned = String(cardName ?? "").replace(/\s+/g, " ").trim();
+	return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen)}…` : cleaned;
+}
+
+function stripPokecaCardVariant(cardName: string): string {
+	return String(cardName ?? "")
+		.replace(/\s*\[[^\]]+\]\s*$/u, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+function isXSingleWeightCodePoint(codePoint: number): boolean {
+	return (
+		(codePoint >= 0x0000 && codePoint <= 0x10ff) ||
+		(codePoint >= 0x2000 && codePoint <= 0x200d) ||
+		(codePoint >= 0x2010 && codePoint <= 0x201f) ||
+		(codePoint >= 0x2032 && codePoint <= 0x2037)
+	);
+}
+
+function countXWeightedLength(text: string): number {
+	const source = String(text ?? "");
+	const urlRegex = /https?:\/\/\S+/g;
+	let total = 0;
+	let cursor = 0;
+	let match: RegExpExecArray | null;
+	while ((match = urlRegex.exec(source)) !== null) {
+		total += countXWeightedLengthWithoutUrl(source.slice(cursor, match.index));
+		total += 23;
+		cursor = match.index + match[0].length;
+	}
+	total += countXWeightedLengthWithoutUrl(source.slice(cursor));
+	return total;
+}
+
+function countXWeightedLengthWithoutUrl(text: string): number {
+	let total = 0;
+	for (const ch of String(text ?? "")) {
+		const codePoint = ch.codePointAt(0) ?? 0;
+		total += isXSingleWeightCodePoint(codePoint) ? 1 : 2;
+	}
+	return total;
+}
+
+function buildPokecaSummarySample(): string {
+	const lines: string[] = ["【ポケカ 高騰ランキング -フリマ- TOP10】"];
+	lines.push("ここ一週間で、ピカチュウ系カードの高騰が目立つようです。", "");
+	const samples = [
+		"リーリエ [SM4+ 119/114]",
+		"アセロラ [SM2+ 056/049]",
+		"ルザミーネ [SM4A 055/050]",
+		"マリィ [S4a 198/190]",
+		"ナンジャモ [SV2D 096/071]",
+		"エリカのおもてなし [SM9 107/095]",
+		"シロナ [SM5M 070/066]",
+		"かんこうきゃく [SM12a 192/173]",
+		"ブラッキーVMAX [S6a 095/069]",
+		"ピカチュウ [M 001/002]",
+	];
+	for (const [idx, cardName] of samples.entries()) {
+		lines.push(`${idx + 1}. ${compactPokecaRankCardName(cardName, 12)}`);
+	}
+	lines.push("", "#ポケカ");
+	return lines.join("\n");
+}
+
+function buildPokecaSummaryLead(
+	cards: PokecaSummaryCard[],
+	rankTarget: PokecaRankTarget,
+	now = new Date(),
+): string | null {
+	const jst = getJstNow(now);
+	const dow = jst.getUTCDay();
+	if (rankTarget === "rank_rise_7") {
+		const topCards = cards.slice(0, POKECA_POST_RANK_LIMIT);
+		const pikachuCount = topCards.filter((card) => /ピカチュウ/i.test(card.cardName)).length;
+		if (pikachuCount >= 3) {
+			return "観測メモ: ピカチュウ系が強め。";
+		}
+		return "観測メモ: 上振れ銘柄を追跡。";
+	}
+	if (rankTarget === "rank_fall_7") {
+		return "観測メモ: 調整幅が大きい銘柄。";
+	}
+	if (dow === 0) {
+		return "観測メモ: 日曜は取引集中銘柄。";
+	}
+	return "観測メモ: 取引集中銘柄を確認。";
+}
+
+function getPokecaRankWindowLabel(rankTarget: PokecaRankTarget): string | null {
+	if (rankTarget === "rank_rise_7" || rankTarget === "rank_fall_7") return "過去7日";
+	return null;
+}
+
+function getPokecaPostTitle(rankTarget: PokecaRankTarget): string {
+	if (rankTarget === "rank_fall_7") return "ポケカ相場下落ウォッチ";
+	if (rankTarget === "rank_vol") return "ポケカ注目取引ウォッチ";
+	return "ポケカ相場急騰ウォッチ";
+}
+
+function buildPokecaSummaryImageAlt(cardName: string): string {
+	return `カード画像: ${String(cardName ?? "").trim()}`;
+}
+
+function formatJstDateLabel(now = new Date()): string {
+	const jst = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+	const month = String(jst.getMonth() + 1);
+	const day = String(jst.getDate());
+	return `${month}/${day}`;
+}
+
+function buildPokecaSummaryMessage(
+	cards: PokecaSummaryCard[],
+	rankLabel: string,
+	rankTarget: PokecaRankTarget,
+	now = new Date(),
+): { text: string; displayedCount: number } {
+	const fullTopCards = cards.slice(0, POKECA_POST_RANK_LIMIT);
+	const lead = buildPokecaSummaryLead(fullTopCards, rankTarget, now);
+	const postTitle = getPokecaPostTitle(rankTarget);
+	const rankWindow = getPokecaRankWindowLabel(rankTarget);
+	const dateLabel = formatJstDateLabel(now);
+	const collectedLine = rankWindow
+		? `${dateLabel}（${rankWindow}）`
+		: dateLabel;
+	const rankCountCandidates = [POKECA_POST_RANK_LIMIT, 8, 5, 4, 3, 2, 1].filter(
+		(n, i, arr) => n > 0 && cards.length >= n && arr.indexOf(n) === i,
+	);
+	const templates: Array<{ includeLead: boolean; includeCollectedLine: boolean }> = [
+		{ includeLead: true, includeCollectedLine: true },
+		{ includeLead: true, includeCollectedLine: false },
+		{ includeLead: false, includeCollectedLine: true },
+		{ includeLead: false, includeCollectedLine: false },
+	];
+
+	for (const rankCount of rankCountCandidates) {
+		const selectedCards = cards.slice(0, rankCount);
+		const header = `【${postTitle} TOP${rankCount}】`;
+		for (const template of templates) {
+			const lines: string[] = [header];
+			if (template.includeCollectedLine) {
+				lines.push(collectedLine, "");
+			}
+			if (template.includeLead && lead) {
+				lines.push(lead, "");
+			}
+			for (const [idx, card] of selectedCards.entries()) {
+				lines.push(`${idx + 1}. ${card.cardName} ${formatNumber(card.price)}円`);
+			}
+			lines.push("", "#ポケカ");
+			const text = lines.join("\n");
+			if (countXWeightedLength(text) <= POKECA_TWEET_TEXT_LIMIT) {
+				return { text, displayedCount: selectedCards.length };
+			}
+		}
+	}
+
+	const fallbackCount = Math.min(5, cards.length);
+	const fallbackCards = cards.slice(0, fallbackCount);
+	const fallbackHeader = `【${postTitle} TOP${fallbackCount}】`;
+	const fallbackLines = [fallbackHeader];
+	fallbackLines.push(...fallbackCards.map((card, idx) => `${idx + 1}. ${card.cardName} ${formatNumber(card.price)}円`));
+	fallbackLines.push("", "#ポケカ");
+	return { text: fallbackLines.join("\n"), displayedCount: fallbackCards.length };
+}
+
+function hexToBytes(hex: string): Uint8Array {
+	const normalized = String(hex ?? "").trim().replace(/[^0-9a-f]/gi, "");
+	if (!normalized || normalized.length % 2 !== 0) return new Uint8Array();
+	const out = new Uint8Array(normalized.length / 2);
+	for (let i = 0; i < normalized.length; i += 2) {
+		out[i / 2] = Number.parseInt(normalized.slice(i, i + 2), 16);
+	}
+	return out;
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+	const cleaned = String(base64 ?? "").trim();
+	if (!cleaned) return new Uint8Array();
+	const binary = atob(cleaned);
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i += 1) {
+		bytes[i] = binary.charCodeAt(i);
+	}
+	return bytes;
+}
+
+async function decryptPokecaApiPayload(
+	cipherBase64: string,
+	passphrase: string,
+	saltHex: string,
+	ivHex: string,
+): Promise<string | null> {
+	try {
+		const encoder = new TextEncoder();
+		const keyMaterial = await crypto.subtle.importKey("raw", encoder.encode(passphrase), "PBKDF2", false, [
+			"deriveBits",
+		]);
+		const keyBits = await crypto.subtle.deriveBits(
+			{
+				name: "PBKDF2",
+				hash: "SHA-512",
+				iterations: 100,
+				salt: hexToBytes(saltHex),
+			},
+			keyMaterial,
+			256,
+		);
+		const aesKey = await crypto.subtle.importKey("raw", keyBits, { name: "AES-CBC" }, false, ["decrypt"]);
+		const plain = await crypto.subtle.decrypt(
+			{ name: "AES-CBC", iv: hexToBytes(ivHex) },
+			aesKey,
+			base64ToBytes(cipherBase64),
+		);
+		return new TextDecoder().decode(plain);
+	} catch {
+		return null;
+	}
+}
+
+async function fetchPokecaApiItems(): Promise<PokecaApiItem[]> {
+	try {
+		const res = await fetch(POKECA_CHART_API_URL, {
+			headers: { "user-agent": "Mozilla/5.0", referer: POKECA_CHART_URL_ORIGIN },
+		});
+		if (!res.ok) return [];
+		const body = (await res.json()) as {
+			code?: number;
+			data?: { c?: string; s?: string; i?: string };
+		};
+		if (body.code !== 0 || !body.data?.c || !body.data?.s || !body.data?.i) return [];
+		const passphrase = `${POKECA_CHART_PASS_PHRASE_HEAD}${getJstYmd()}`;
+		const decrypted = await decryptPokecaApiPayload(body.data.c, passphrase, body.data.s, body.data.i);
+		if (!decrypted) return [];
+		const parsed = JSON.parse(decrypted) as Record<string, PokecaApiItem>;
+		return Object.values(parsed ?? {});
+	} catch {
+		return [];
+	}
+}
+
+function pickPokecaCardsFromRank(items: PokecaApiItem[], rank: PokecaRankTarget): PokecaSummaryCard[] {
+	const sorted = [...items].sort((a, b) => {
+		const aValue = getPokecaRankSortValue(a, rank);
+		const bValue = getPokecaRankSortValue(b, rank);
+		if (rank === "rank_fall_7") return aValue - bValue;
+		return bValue - aValue;
+	});
+	const nowIso = new Date().toISOString();
+	const cards: PokecaSummaryCard[] = [];
+	for (const item of sorted) {
+		const slug = String(item.strSlug ?? "").trim();
+		const cardName = String(item.strName ?? "").trim();
+		const price = getPokecaSummaryPrice(item);
+		if (!slug || !cardName || price == null) continue;
+		const imageUrlRaw = String(item.strImgUrl ?? "").trim();
+		const imageUrl = imageUrlRaw && /^https?:\/\//i.test(imageUrlRaw) ? imageUrlRaw : null;
+		cards.push({
+			cardName,
+			price,
+			imageUrl,
+			url: normalizePokecaCardUrl(slug),
+			fetchedAt: nowIso,
+		});
+	}
+	return cards;
+}
+
+async function runPokecaSummaryDebug(): Promise<Record<string, unknown>> {
+	const items = await fetchPokecaApiItems();
+	const riseCards = pickPokecaCardsFromRank(items, "rank_rise_7").slice(0, 3);
+	return {
+		ok: true,
+		mode: "pokeca_summary_debug",
+		apiUrl: POKECA_CHART_API_URL,
+		items: items.length,
+		topRise3: riseCards.map((card, idx) => ({
+			rank: idx + 1,
+			cardName: card.cardName,
+			price: card.price,
+			url: card.url,
+			imageUrl: card.imageUrl,
+		})),
+	};
+}
+
+function getPokecaArchiveImageExtension(contentType: string | null): string {
+	const normalized = String(contentType ?? "").toLowerCase();
+	if (normalized.includes("png")) return ".png";
+	if (normalized.includes("webp")) return ".webp";
+	if (normalized.includes("gif")) return ".gif";
+	return ".jpg";
+}
+
+function makePokecaArchiveImageKey(dateKey: string, index: number, cardUrl: string): string {
+	try {
+		const path = new URL(cardUrl).pathname.replace(/^\/+|\/+$/g, "");
+		const compactPath = path.replace(/[^a-zA-Z0-9/_-]/g, "").replace(/\//g, "_");
+		const base = compactPath || `card_${index + 1}`;
+		return `pokeca-summary/${dateKey}/${String(index + 1).padStart(3, "0")}_${base}`;
+	} catch {
+		return `pokeca-summary/${dateKey}/${String(index + 1).padStart(3, "0")}_card`;
+	}
+}
+
+function getPokecaSummaryDailyKey(dateKey: string, rankTarget: PokecaRankTarget): string {
+	return `${POKECA_SUMMARY_DAILY_PREFIX}${dateKey}:${rankTarget}`;
+}
+
+function isPokecaImageArchiveEnabled(env: MonitorEnv): boolean {
+	return parseBooleanEnv(env.POKECA_ARCHIVE_IMAGES, true);
+}
+
+async function loadPokecaSummarySnapshot(
+	stateStore: StateStore,
+	dateKey: string,
+	rankTarget: PokecaRankTarget,
+): Promise<PokecaSummarySnapshot | null> {
+	const raw = await stateStore.get(getPokecaSummaryDailyKey(dateKey, rankTarget));
+	if (!raw) return null;
+	try {
+		const parsed = JSON.parse(raw) as Partial<PokecaSummarySnapshot>;
+		if (parsed.rankTarget !== rankTarget || !Array.isArray(parsed.cards) || parsed.cards.length === 0) return null;
+		const cards = parsed.cards.filter(
+			(card): card is PokecaSummaryCard =>
+				Boolean(card) &&
+				typeof card.cardName === "string" &&
+				typeof card.price === "number" &&
+				typeof card.url === "string" &&
+				typeof card.fetchedAt === "string",
+		).slice(0, POKECA_SNAPSHOT_TOP_LIMIT);
+		if (cards.length === 0) return null;
+		return {
+			rankTarget,
+			cards,
+			apiItemCount: Number(parsed.apiItemCount ?? cards.length),
+			snapshotFetchedAt: String(parsed.snapshotFetchedAt ?? ""),
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function archivePokecaSummaryImages(
+	cards: PokecaSummaryCard[],
+	dateKey: string,
+	env: MonitorEnv,
+): Promise<{ archived: number; skipped: number; failed: number }> {
+	const bucket = env.POKECA_IMAGE_ARCHIVE;
+	if (!bucket || !isPokecaImageArchiveEnabled(env)) {
+		return { archived: 0, skipped: cards.length, failed: 0 };
+	}
+	let archived = 0;
+	let skipped = 0;
+	let failed = 0;
+	for (const [index, card] of cards.entries()) {
+		if (!card.imageUrl) {
+			card.imageR2Key = null;
+			skipped += 1;
+			continue;
+		}
+		try {
+			const imageRes = await fetch(card.imageUrl, {
+				headers: { "user-agent": "Mozilla/5.0" },
+			});
+			if (!imageRes.ok) {
+				card.imageR2Key = null;
+				failed += 1;
+				continue;
+			}
+			const contentType = imageRes.headers.get("content-type");
+			if (!String(contentType ?? "").toLowerCase().startsWith("image/")) {
+				card.imageR2Key = null;
+				skipped += 1;
+				continue;
+			}
+			const baseKey = makePokecaArchiveImageKey(dateKey, index, card.url);
+			const objectKey = `${baseKey}${getPokecaArchiveImageExtension(contentType)}`;
+			await bucket.put(objectKey, imageRes.body, {
+				httpMetadata: contentType ? { contentType } : undefined,
+				customMetadata: {
+					cardName: card.cardName,
+					sourceUrl: card.url,
+					imageUrl: card.imageUrl,
+					fetchedAt: card.fetchedAt,
+				},
+			});
+			card.imageR2Key = objectKey;
+			archived += 1;
+		} catch {
+			card.imageR2Key = null;
+			failed += 1;
+		}
+	}
+	return { archived, skipped, failed };
+}
+
+async function runPokecaSummary(
+	env: MonitorEnv,
+	options: {
+		commit?: boolean;
+		logToConsole?: boolean;
+		fromSchedule?: boolean;
+		rank?: string | null;
+		imageLimit?: number;
+		preferStoredSnapshot?: boolean;
+		persistSnapshotOnly?: boolean;
+		persistFetchedSnapshot?: boolean;
+		preloadedItems?: PokecaApiItem[] | null;
+	} = {},
+): Promise<Record<string, unknown>> {
+	const {
+		commit = false,
+		logToConsole = true,
+		fromSchedule = false,
+		rank,
+		imageLimit,
+		preferStoredSnapshot = false,
+		persistSnapshotOnly = false,
+		persistFetchedSnapshot = true,
+		preloadedItems = null,
+	} = options;
+	const stateStore = createStateStore(env);
+	const now = new Date();
+	const jstNow = getJstNow(now);
+	const dateKey = getJstYmd(now);
+	const { rankTarget, rankSource } = resolvePokecaRankTarget(rank, jstNow);
+	const rankLabel = getPokecaRankLabel(rankTarget);
+	const kvKey = getPokecaSummaryDailyKey(dateKey, rankTarget);
+	let cards: PokecaSummaryCard[] | null = null;
+	let fetchedCount = 0;
+	let archive = { archived: 0, skipped: 0, failed: 0 };
+	let snapshotSource: "stored" | "fetched" = "fetched";
+
+	if (preferStoredSnapshot) {
+		const snapshot = await loadPokecaSummarySnapshot(stateStore, dateKey, rankTarget);
+		if (snapshot) {
+			cards = snapshot.cards;
+			fetchedCount = snapshot.apiItemCount;
+			snapshotSource = "stored";
+		}
+	}
+
+	if (!cards) {
+		const items = Array.isArray(preloadedItems) ? preloadedItems : await fetchPokecaApiItems();
+		fetchedCount = items.length;
+		cards = pickPokecaCardsFromRank(items, rankTarget).slice(0, POKECA_SNAPSHOT_TOP_LIMIT);
+		if (persistFetchedSnapshot) {
+			archive = await archivePokecaSummaryImages(cards, dateKey, env);
+			const snapshot: PokecaSummarySnapshot = {
+				rankTarget,
+				cards,
+				apiItemCount: items.length,
+				snapshotFetchedAt: new Date().toISOString(),
+			};
+			await stateStore.put(kvKey, JSON.stringify(snapshot));
+		}
+	}
+	if (persistSnapshotOnly) {
+		const result = {
+			ok: cards.length > 0,
+			fromSchedule,
+			commitMode: commit,
+			committed: false,
+			postedToX: false,
+			persistSnapshotOnly,
+			persistFetchedSnapshot,
+			rankTarget,
+			rankSource,
+			rankLabel,
+			fetchedCount,
+			displayedCount: 0,
+			archive,
+			snapshotKey: kvKey,
+			snapshotSource,
+			snapshotCardCount: cards.length,
+			snapshotTopLimit: POKECA_SNAPSHOT_TOP_LIMIT,
+			imageLimitUsed: 0,
+			messageLengthWeighted: 0,
+			previewMessage: "",
+			previewImages: [],
+			xResponse: null,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "POKECA_SUMMARY_RESULT", ...result }, null, 2));
+		return result;
+	}
+
+	if (cards.length < POKECA_POST_RANK_LIMIT) {
+		const result = {
+			ok: false,
+			reason: "pokeca_rank_fetch_failed",
+			fromSchedule,
+			rankTarget,
+			rankSource,
+			fetchedItems: fetchedCount,
+			fetchedCards: cards.length,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "POKECA_SUMMARY_SKIP", ...result }, null, 2));
+		return result;
+	}
+	const rankedCards = cards.slice(0, POKECA_POST_RANK_LIMIT);
+	const { text: message, displayedCount } = buildPokecaSummaryMessage(rankedCards, rankLabel, rankTarget, now);
+	const resolvedImageLimit =
+		typeof imageLimit === "number"
+			? Math.max(0, Math.min(3, Math.trunc(imageLimit)))
+			: POKECA_POST_IMAGE_LIMIT;
+	const imageItems = rankedCards
+		.filter((c) => c.imageUrl)
+		.slice(0, resolvedImageLimit)
+		.map((c) => ({ url: c.imageUrl!, alt: buildPokecaSummaryImageAlt(c.cardName) }));
+
+	let postedToX = false;
+	let xResponse: unknown = null;
+	if (commit) {
+		const postResult = await postTweetWithImages(
+			message,
+			{
+				mainImageUrl: imageItems[0]?.url ?? null,
+				lastOneImageUrl: imageItems[1]?.url ?? null,
+			},
+			env,
+			{
+				mainImageAlt: imageItems[0]?.alt ?? null,
+				lastOneImageAlt: imageItems[1]?.alt ?? null,
+				additionalImageUrls: imageItems.slice(2).map((x) => x.url),
+				additionalImageAlts: imageItems.slice(2).map((x) => x.alt),
+			},
+		);
+		postedToX = postResult.ok;
+		xResponse = postResult;
+	}
+
+	const result = {
+		ok: true,
+		fromSchedule,
+		commitMode: commit,
+		committed: commit && postedToX,
+		postedToX,
+		persistSnapshotOnly,
+		persistFetchedSnapshot,
+		rankTarget,
+		rankSource,
+		rankLabel,
+		fetchedCount,
+		displayedCount,
+		archive,
+		snapshotKey: kvKey,
+		snapshotSource,
+		snapshotCardCount: cards.length,
+		snapshotTopLimit: POKECA_SNAPSHOT_TOP_LIMIT,
+		imageLimitUsed: resolvedImageLimit,
+		messageLengthWeighted: countXWeightedLength(message),
+		previewMessage: message,
+		previewImages: imageItems.map((x) => ({ url: x.url, cardName: x.alt })),
+		xResponse,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "POKECA_SUMMARY_RESULT", ...result }, null, 2));
+	return result;
+}
+
+async function seedWatchlistFromSnkrdunk(
+	stateStore: StateStore,
+	options: { targetCount: number; scanLimit: number },
+): Promise<{ seeded: number; scanned: number; watchlist: WatchlistEntry[] }> {
+	let current = await getWatchlistEntries(stateStore);
+	const targetCount = Math.max(1, options.targetCount);
+	if (current.length >= targetCount) {
+		return { seeded: 0, scanned: 0, watchlist: current };
+	}
+	const listing = await fetch("https://snkrdunk.com/departments/hobby", {
+		headers: { "user-agent": "Mozilla/5.0" },
+	});
+	let ids: string[] = [];
+	let listingSeedRows: Array<{ apparelId: string; cardName: string; price: number; imageUrl: string | null }> = [];
+	let seeded = 0;
+	let scanned = 0;
+	if (listing.ok) {
+		const html = await listing.text();
+		listingSeedRows = extractSnkrdunkSeedRowsFromListingHtml(html).slice(0, Math.max(options.scanLimit * 3, 24));
+		ids = Array.from(
+			new Set(
+				[...html.matchAll(/\/apparels\/(\d{3,10})/g)]
+					.map((m) => String(m[1] ?? "").trim())
+					.filter(Boolean),
+			),
+		);
+	}
+	const nowIso = new Date().toISOString();
+	for (const row of listingSeedRows) {
+		if (current.length >= targetCount) break;
+		const key = `snkrdunk:${row.apparelId}`;
+		const prev = current.find((item) => item.key === key) ?? null;
+		const beforePrice = prev?.currentPrice && prev.currentPrice > 0 ? prev.currentPrice : Math.max(1, Math.round(row.price * 0.97));
+		const nextHistory = appendWatchPriceHistory(prev?.priceHistory ?? [], nowIso, row.price);
+		const nextItem: WatchlistEntry = {
+			key,
+			cardName: normalizeSnkrdunkCardName(row.cardName),
+			card: normalizeSnkrdunkCardName(row.cardName),
+			cardId: null,
+			sourceUrl: `https://snkrdunk.com/apparels/${row.apparelId}`,
+			sourceSite: "snkrdunk",
+			firstSeenAt: prev?.firstSeenAt ?? nowIso,
+			lastSeenAt: nowIso,
+			currentPrice: row.price,
+			beforePrice,
+			afterPrice: row.price,
+			changePct: calcPercentChange(beforePrice, row.price),
+			period: "直近",
+			imageUrl: normalizeWatchImageUrl(row.imageUrl, "snkrdunk") ?? prev?.imageUrl ?? null,
+			firstSeenPrice: prev?.firstSeenPrice ?? beforePrice,
+			priceHistory: nextHistory,
+		};
+		const existed = current.some((item) => item.key === key);
+		current = [nextItem, ...current.filter((item) => item.key !== key)]
+			.sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime())
+			.slice(0, WATCHLIST_LIMIT);
+		if (!existed) seeded += 1;
+	}
+	if (ids.length === 0) {
+		ids = [...SNKRDUNK_SEED_FALLBACK_IDS];
+	}
+	if (ids.length === 0) return { seeded: 0, scanned: 0, watchlist: current };
+	const jstSeed = getJstDateSeed() % ids.length;
+	const ordered = [...ids.slice(jstSeed), ...ids.slice(0, jstSeed)].slice(0, Math.max(1, options.scanLimit));
+	for (const id of ordered) {
+		if (current.length >= targetCount) break;
+		const sourceUrl = `https://snkrdunk.com/apparels/${id}`;
+		scanned += 1;
+		try {
+			const page = await fetchPriceSpikeSourcePage(sourceUrl);
+			if (page.status < 200 || page.status >= 400) continue;
+			const price = extractCurrentPriceFromSourceHtml(page.html);
+			if (!Number.isFinite(price) || price == null || price <= 0) continue;
+			const title = extractSourceTitle(page.html) ?? `snkrdunk-${id}`;
+			const cardName = normalizeSnkrdunkCardName(title);
+			const key = `snkrdunk:${id}`;
+			const prev = current.find((item) => item.key === key) ?? null;
+			const beforePrice =
+				prev?.currentPrice && prev.currentPrice > 0 ? prev.currentPrice : Math.max(1, Math.round(price * 0.97));
+			const nextHistory = appendWatchPriceHistory(prev?.priceHistory ?? [], nowIso, price);
+			const sourceOrigin = new URL(page.finalUrl || sourceUrl).origin;
+			const imageUrl = normalizeWatchImageUrl(extractOgImageUrl(page.html, sourceOrigin), "snkrdunk");
+			const nextItem: WatchlistEntry = {
+				key,
+				cardName,
+				card: cardName,
+				cardId: null,
+				sourceUrl,
+				sourceSite: "snkrdunk",
+				firstSeenAt: prev?.firstSeenAt ?? nowIso,
+				lastSeenAt: nowIso,
+				currentPrice: price,
+				beforePrice,
+				afterPrice: price,
+				changePct: calcPercentChange(beforePrice, price),
+				period: "直近",
+				imageUrl: imageUrl ?? prev?.imageUrl ?? null,
+				firstSeenPrice: prev?.firstSeenPrice ?? beforePrice,
+				priceHistory: nextHistory,
+			};
+			const existed = current.some((item) => item.key === key);
+			current = [nextItem, ...current.filter((item) => item.key !== key)]
+				.sort((a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime())
+				.slice(0, WATCHLIST_LIMIT);
+			if (!existed) seeded += 1;
+		} catch {
+			// keep seeding loop resilient
+		}
+	}
+	await stateStore.put(WATCHLIST_KEY, JSON.stringify(current));
+	return { seeded, scanned, watchlist: current };
 }
 
 async function generateMarketSummaryMessage(
@@ -925,17 +1986,26 @@ function validateMarketSummaryMessage(text: string): { ok: boolean; reasons: str
 
 function buildMarketSummaryFallbackMessage(
 	picked: WatchlistEntry[],
-	theme: { label: string },
+	theme: { label: string; sortBy?: "change_desc" | "change_asc" | "spike_recent" | "price_desc" },
 ): string {
 	const label = getJstMarketSummaryLabel();
 	const lines: string[] = [`【${label}${theme.label}】`];
+	const priceOnly = theme.sortBy === "price_desc";
 	for (const [idx, item] of picked.slice(0, 5).entries()) {
 		const startPrice = getSummaryStartPrice(item);
 		const pct = calcPercentChange(startPrice, item.currentPrice);
 		const rank = getRankBadge(idx);
 		const key = compactCardLabel(item.cardName);
 		const range = `${formatJstMonthDay(getSummaryRangeStartDate(item))}→${formatJstMonthDay(item.lastSeenAt)}`;
-		lines.push("", `${rank} ${key}`, `${formatNumber(startPrice)}円→${formatNumber(item.currentPrice)}円（${range} ${signedPercentText(pct)}）`);
+		if (priceOnly) {
+			lines.push("", `${rank} ${key}`, `現在価格 ${formatNumber(item.currentPrice)}円`);
+		} else {
+			lines.push(
+				"",
+				`${rank} ${key}`,
+				`${formatNumber(startPrice)}円→${formatNumber(item.currentPrice)}円（${range} ${signedPercentText(pct)}）`,
+			);
+		}
 	}
 	lines.push("", "#ポケカ");
 	return lines.join("\n");
@@ -1044,6 +2114,66 @@ function compactCardLabel(card: string): string {
 	return cleaned.length > 42 ? `${cleaned.slice(0, 42)}…` : cleaned;
 }
 
+function normalizeSnkrdunkCardName(title: string): string {
+	const cleaned = String(title ?? "")
+		.replace(/\s+/g, " ")
+		.replace(/\s*[-|｜]\s*スニーカーダンク.*$/i, "")
+		.replace(/\s*[-|｜]\s*SNKRDUNK.*$/i, "")
+		.trim();
+	return cleaned || "ポケモンカード";
+}
+
+function isLikelyPokemonCardLabel(label: string): boolean {
+	const text = String(label ?? "").trim();
+	if (!text) return false;
+	// Allow broad Pokemon card names while excluding major non-Pokemon categories.
+	if (/ワンピース|one\s*piece|遊戯王|デュエマ|デュエルマスターズ|ドラゴンボール|バトスピ|ヴァイス|union\s*arena|ユニオンアリーナ|gundam|ガンダム|フィギュア|プラモ/i.test(text)) {
+		return false;
+	}
+	return true;
+}
+
+function hasMeaningfulChangeForSummary(item: WatchlistEntry): boolean {
+	const startPrice = getSummaryStartPrice(item);
+	const pct = Math.abs(calcPercentChange(startPrice, item.currentPrice));
+	if (pct >= 1) return true;
+	const startDay = formatJstMonthDay(getSummaryRangeStartDate(item));
+	const endDay = formatJstMonthDay(item.lastSeenAt);
+	return startDay !== endDay;
+}
+
+function extractSnkrdunkSeedRowsFromListingHtml(
+	html: string,
+): Array<{ apparelId: string; cardName: string; price: number; imageUrl: string | null }> {
+	const rows: Array<{ apparelId: string; cardName: string; price: number; imageUrl: string | null }> = [];
+	const pattern =
+		/\\"apparelId\\":(\d{3,10}),\\"localizedName\\":\\"([^\\"]+)\\"[\s\S]{0,260}?\\"price\\":([0-9]{2,9})[\s\S]{0,260}?\\"imageUrl\\":\\"([^\\"]+)\\"/g;
+	let m: RegExpExecArray | null;
+	while ((m = pattern.exec(html)) !== null) {
+		const apparelId = String(m[1] ?? "").trim();
+		const rawName = decodeHtmlEntities(String(m[2] ?? "").replace(/\\\//g, "/")).trim();
+		const price = Number(m[3] ?? NaN);
+		const imageUrl = String(m[4] ?? "").replace(/\\\//g, "/").trim();
+		if (!apparelId) continue;
+		if (!Number.isFinite(price) || price <= 0) continue;
+		if (!isLikelyPokemonCardLabel(rawName)) continue;
+		const cardName = normalizeSnkrdunkCardName(rawName);
+		rows.push({
+			apparelId,
+			cardName,
+			price,
+			imageUrl: normalizeWatchImageUrl(imageUrl, "snkrdunk"),
+		});
+	}
+	const dedup = new Map<string, { apparelId: string; cardName: string; price: number; imageUrl: string | null }>();
+	for (const row of rows) {
+		if (!dedup.has(row.apparelId) || (dedup.get(row.apparelId)?.price ?? 0) < row.price) {
+			dedup.set(row.apparelId, row);
+		}
+	}
+	return [...dedup.values()].sort((a, b) => b.price - a.price);
+}
+
 function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
 	const normalized = String(value ?? "").trim().toLowerCase();
 	if (!normalized) return defaultValue;
@@ -1075,6 +2205,8 @@ async function generatePriceSpikeMessage(
 	const period = normalizePriceSpikePeriod(spike.period);
 	const canonicalCardName = getCanonicalPriceSpikeCardName(spike);
 	const sourceSite = normalizePriceSpikeSource(spike.source_site) || "snkrdunk/pokeca-chart";
+	const dateRange = getPriceSpikeDateRangeText(spike);
+	const addTrendLine = isPriceSpikeWithin24Hours(spike);
 	const prompt = [
 		"以下の条件でX投稿文を1本作成してください。",
 		"",
@@ -1084,20 +2216,30 @@ async function generatePriceSpikeMessage(
 		`現在価格: ${formatNumber(spike.after)}円`,
 		`変化率: +${Number(spike.change_pct).toFixed(2)}%`,
 		`比較期間: ${period}`,
+		`表示用日付範囲: ${dateRange}`,
+		`24時間以内フラグ: ${addTrendLine ? "yes" : "no"}`,
 		`取得時刻: ${spike.fetched_at}`,
 		`参照サイト: ${sourceSite}`,
 		"",
 		"【出力ルール】",
-		"- 1行目: 上記のカード名（厳密）をそのまま使い、『{period}で+{変化率}%』の形式で書く",
-		"- 2行目: {前回価格}円 → {現在価格}円（+{変化率}%）",
-		"- 3行目: 背景の一文。『〜の影響かな』『〜が重なってるかも』のように推察をやわらかく書く",
+		"- 1行目: `💣価格スパイク速報🔥`",
+		"- 2行目: 空行",
+		"- 3行目: `【カード名】` の形式で書く",
+		"- 4行目: 空行",
+		"- 5行目: 表示用日付範囲",
+		"- 6行目: 空行",
+		"- 7行目: {前回価格}円 → {現在価格}円（+{変化率}%）",
+		"- 8行目: 空行",
+		"- 9行目: 24時間以内フラグがyesの時だけ `24時間以内のトレンドを確認。` を入れる。noの時はこの行を省略",
+		"- 10行目: 空行（9行目を省略した時は不要）",
+		"- 11行目: #ポケカ",
 		"- URLは一切含めない（市場情報のみ）",
 		"- ハッシュタグは #ポケカ 固定（1つのみ）",
-		"- period 未指定時は『直近で』として書く",
-		"- 文字数は60〜100文字",
+		"- できるだけ改行を多くして読みやすくする",
+		"- 文字数は60〜120文字",
 		"- 禁止: 『急げ』『爆アツ』『絶対』などの断定・煽り",
 		"- 根拠のない価格予測・断定は禁止",
-		"- 行構成を崩さない（1行目/2行目/3行目）",
+		"- 行構成を崩さない",
 	].join("\n");
 	const response = await callAnthropicTextGeneration({
 		system: PRICE_SPIKE_SYSTEM_PROMPT,
@@ -1119,8 +2261,15 @@ function normalizePriceSpikeMessage(text: string): string {
 		.split(/\n+/)
 		.map((line) => line.replace(/#[\p{L}\p{N}_]+/gu, "").replace(/\s+/g, " ").trim())
 		.filter(Boolean);
-	const firstThree = lines.slice(0, 3);
-	return [...firstThree, "#ポケカ"].join("\n").trim();
+	const title = "💣価格スパイク速報🔥";
+	const card = lines.find((line) => /^【.+】$/.test(line)) ?? "";
+	const dateRange = lines.find((line) => /^\d{1,2}\/\d{1,2}〜\d{1,2}\/\d{1,2}$/.test(line)) ?? "";
+	const price = lines.find((line) => /円\s*→\s*[0-9,]+円（[+\-][0-9]+(?:\.[0-9]+)?%）/.test(line)) ?? "";
+	const trend = lines.find((line) => /24時間以内のトレンドを確認。/.test(line)) ?? "";
+	const out = [title, "", card, "", dateRange, "", price];
+	if (trend) out.push("", trend);
+	out.push("", "#ポケカ");
+	return out.join("\n").trim();
 }
 
 function validatePriceSpikeMessage(
@@ -1130,14 +2279,16 @@ function validatePriceSpikeMessage(
 	const reasons: string[] = [];
 	const length = countXLength(text);
 	if (length < 60) reasons.push(`文字数不足(${length})`);
-	if (length > 100) reasons.push(`文字数超過(${length})`);
+	if (length > 120) reasons.push(`文字数超過(${length})`);
 	if (!/#ポケカ/u.test(text)) reasons.push("#ポケカがありません");
 	if ((text.match(/#[\p{L}\p{N}_]+/gu) ?? []).length !== 1) reasons.push("ハッシュタグは #ポケカ のみ");
 	if (/急げ|爆アツ|今すぐ|絶対|確実|上がる|まだ伸びる/.test(text)) reasons.push("禁止表現を検出");
 	if (/正直|個人的/.test(text)) reasons.push("主観表現を検出");
-	if (!/円\s*→\s*[0-9,]+円/.test(text)) reasons.push("2行目の価格表記形式が不正です");
-	if (!new RegExp(`${escapeRegExp(period)}で\\+[0-9]+(?:\\.[0-9]+)?%`).test(text)) {
-		reasons.push("1行目の期間+変化率表記が不足しています");
+	if (!/価格スパイク速報/.test(text)) reasons.push("タイトル行が不足しています");
+	if (!/^【.+】$/m.test(text)) reasons.push("カード名行が不足しています");
+	if (!/\d{1,2}\/\d{1,2}〜\d{1,2}\/\d{1,2}/.test(text)) reasons.push("日付範囲行が不足しています");
+	if (!/円\s*→\s*[0-9,]+円（[+\-][0-9]+(?:\.[0-9]+)?%）/.test(text)) {
+		reasons.push("価格表記形式が不正です");
 	}
 	const lineCount = text.split(/\n/).filter(Boolean).length;
 	if (lineCount < 3) reasons.push("行数が不足しています（最低3行）");
@@ -1146,16 +2297,46 @@ function validatePriceSpikeMessage(
 }
 
 function buildPriceSpikeFallbackMessage(spike: PriceSpikeItem): string {
-	const period = normalizePriceSpikePeriod(spike.period);
 	const cardName = getCanonicalPriceSpikeCardName(spike);
 	const pct = Number(spike.change_pct);
 	const sign = pct >= 0 ? "+" : "-";
+	const dateRange = getPriceSpikeDateRangeText(spike);
+	const includeTrendLine = isPriceSpikeWithin24Hours(spike);
 	const lines = [
-		`${cardName}`,
-		`${formatNumber(spike.before)}円 → ${formatNumber(spike.after)}円（${period} ${sign}${Math.abs(pct).toFixed(2)}%）`,
-		"#ポケカ",
+		"💣価格スパイク速報🔥",
+		"",
+		`【${cardName}】`,
+		"",
+		dateRange,
+		"",
+		`${formatNumber(spike.before)}円 → ${formatNumber(spike.after)}円（${sign}${Math.abs(pct).toFixed(2)}%）`,
+		"",
 	];
+	if (includeTrendLine) {
+		lines.push("24時間以内のトレンドを確認。", "");
+	}
+	lines.push("#ポケカ");
 	return lines.join("\n");
+}
+
+function buildPriceSpikeImageAlt(spike: PriceSpikeItem): string {
+	const cardName = getCanonicalPriceSpikeCardName(spike);
+	const pct = Number(spike.change_pct);
+	const sign = pct >= 0 ? "+" : "-";
+	return `${cardName} | ${formatNumber(spike.after)}円（前回比${sign}${Math.abs(pct).toFixed(0)}%）`;
+}
+
+function getPriceSpikeDateRangeText(spike: PriceSpikeItem): string {
+	const endIso = String(spike.fetched_at ?? "").trim();
+	const startIso = String(spike.previous_fetched_at ?? "").trim() || endIso;
+	return `${formatJstMonthDay(startIso)}〜${formatJstMonthDay(endIso)}`;
+}
+
+function isPriceSpikeWithin24Hours(spike: PriceSpikeItem): boolean {
+	const end = new Date(String(spike.fetched_at ?? ""));
+	const start = new Date(String(spike.previous_fetched_at ?? ""));
+	if (!Number.isFinite(end.getTime()) || !Number.isFinite(start.getTime())) return false;
+	return end.getTime() - start.getTime() <= 24 * 60 * 60 * 1000 && end.getTime() >= start.getTime();
 }
 
 function normalizePriceSpikePeriod(period?: string): string {
@@ -1201,6 +2382,9 @@ function validatePriceSpikeInput(
 	const source = normalizePriceSpikeSource(spike.source_site ?? payloadSource);
 	if (!source) {
 		return { ok: false, reason: "unsupported_source_site" };
+	}
+	if (source !== "pokeca-chart") {
+		return { ok: false, reason: "price_spike_source_disabled" };
 	}
 	if (!isValidPriceSpikeSourceUrl(spike.source_url, source)) {
 		return { ok: false, reason: "invalid_or_missing_source_url" };
@@ -2483,12 +3667,12 @@ async function runMonitor(
 	const stateStore = createStateStore(env);
 	const marketContext = await getLatestMarketContext(stateStore);
 	const items = await fetchAllCandidateItems();
+	let fastMonitorNeeded = false;
 
 	const results: Array<Record<string, unknown>> = [];
 
 	for (const item of items) {
 		const detail = await fetchItemDetail(item);
-		if (detail.percent == null) continue;
 
 		const pickedTitle = pickTitle(item, detail);
 		const title = pickedTitle.title;
@@ -2510,7 +3694,15 @@ async function runMonitor(
 		const shouldForceUnder5 = activeForceLevel === "under_5";
 		const thresholds = ALERT_THRESHOLDS[item.source];
 
-		if ((detail.percent <= thresholds.high || shouldForceUnder1) && !under1Posted) {
+		const metricValue =
+			thresholds.unit === "count" ? detail.detailRemaining : detail.percent;
+		const hasMetric = Number.isFinite(metricValue);
+		if (!hasMetric && !shouldForceUnder1 && !shouldForceUnder5) continue;
+		if (thresholds.unit === "count" && hasMetric && (metricValue as number) <= thresholds.low && !under1Posted) {
+			fastMonitorNeeded = true;
+		}
+
+		if (((hasMetric && (metricValue as number) <= thresholds.high) || shouldForceUnder1) && !under1Posted) {
 			action = "notify_under_1";
 			previewMessage = buildAlertMessage({
 				source: item.source,
@@ -2520,10 +3712,12 @@ async function runMonitor(
 				url: item.url,
 				level: "under_1",
 				includeLastPrize: Boolean(detail.lastOneImageUrl),
+				topPrizeNames: detail.topPrizeNames,
 				marketContext: matchedMarketContext,
 			});
 
 			if (commit) {
+				const imageAlt = buildThresholdAlertImageAlt(title, detail.topPrizeNames);
 				const postResult = await postTweetWithImages(
 					previewMessage,
 					{
@@ -2531,6 +3725,7 @@ async function runMonitor(
 						lastOneImageUrl: detail.lastOneImageUrl,
 					},
 					env,
+					{ mainImageAlt: imageAlt, lastOneImageAlt: imageAlt },
 				);
 
 				postedToX = postResult.ok;
@@ -2541,7 +3736,7 @@ async function runMonitor(
 					committed = true;
 				}
 			}
-		} else if ((detail.percent <= thresholds.low || shouldForceUnder5) && !under5Posted) {
+		} else if (((hasMetric && (metricValue as number) <= thresholds.low) || shouldForceUnder5) && !under5Posted) {
 			action = "notify_under_5";
 			previewMessage = buildAlertMessage({
 				source: item.source,
@@ -2551,10 +3746,12 @@ async function runMonitor(
 				url: item.url,
 				level: "under_5",
 				includeLastPrize: Boolean(detail.lastOneImageUrl),
+				topPrizeNames: detail.topPrizeNames,
 				marketContext: matchedMarketContext,
 			});
 
 			if (commit) {
+				const imageAlt = buildThresholdAlertImageAlt(title, detail.topPrizeNames);
 				const postResult = await postTweetWithImages(
 					previewMessage,
 					{
@@ -2562,6 +3759,7 @@ async function runMonitor(
 						lastOneImageUrl: detail.lastOneImageUrl,
 					},
 					env,
+					{ mainImageAlt: imageAlt, lastOneImageAlt: imageAlt },
 				);
 
 				postedToX = postResult.ok;
@@ -2631,6 +3829,7 @@ async function runMonitor(
 		ok: true,
 		fromSchedule,
 		commitMode: commit,
+		fastMonitorNeeded,
 		count: results.length,
 		items: results,
 	});
@@ -2646,7 +3845,7 @@ function createStateStore(env: Partial<MonitorEnv>): StateStore {
 	}
 
 	console.warn(
-		"[mercari-monitor] STATE binding is missing. Using in-memory fallback store for this process.",
+		"[tcgstore-x] STATE binding is missing. Using in-memory fallback store for this process.",
 	);
 
 	return {
@@ -2657,6 +3856,42 @@ function createStateStore(env: Partial<MonitorEnv>): StateStore {
 	};
 }
 
+type PriceSpikeAuditEntry = {
+	at: string;
+	source: string | null;
+	card: string | null;
+	commit: boolean;
+	ok: boolean;
+	skipped: boolean;
+	postedToX: boolean;
+	reason: string | null;
+	xStatus: number | null;
+};
+
+async function getPriceSpikeAudit(stateStore: StateStore, limit = 30): Promise<PriceSpikeAuditEntry[]> {
+	const raw = await stateStore.get(PRICE_SPIKE_AUDIT_KEY);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!Array.isArray(parsed)) return [];
+		return parsed
+			.filter((row): row is PriceSpikeAuditEntry => Boolean(row) && typeof row === "object")
+			.slice(0, Math.max(1, Math.min(PRICE_SPIKE_AUDIT_LIMIT, limit)));
+	} catch {
+		return [];
+	}
+}
+
+async function appendPriceSpikeAudit(stateStore: StateStore, row: PriceSpikeAuditEntry): Promise<void> {
+	try {
+		const current = await getPriceSpikeAudit(stateStore, PRICE_SPIKE_AUDIT_LIMIT);
+		const next = [row, ...current].slice(0, PRICE_SPIKE_AUDIT_LIMIT);
+		await stateStore.put(PRICE_SPIKE_AUDIT_KEY, JSON.stringify(next));
+	} catch {
+		// best-effort diagnostics only
+	}
+}
+
 function buildAlertMessage({
 	source,
 	title,
@@ -2665,6 +3900,7 @@ function buildAlertMessage({
 	url,
 	level,
 	includeLastPrize,
+	topPrizeNames,
 	marketContext,
 }: {
 	source: MonitorSource;
@@ -2674,6 +3910,7 @@ function buildAlertMessage({
 	url: string;
 	level: AlertLevel;
 	includeLastPrize: boolean;
+	topPrizeNames: string[];
 	marketContext: LatestMarketContext | null;
 }): string {
 	if (source === "mercari") {
@@ -2684,6 +3921,7 @@ function buildAlertMessage({
 			url,
 			level,
 			includeLastPrize,
+			topPrizeNames,
 			marketContext,
 		});
 	}
@@ -2721,6 +3959,7 @@ function buildMercariAlertMessage({
 	url,
 	level,
 	includeLastPrize,
+	topPrizeNames,
 	marketContext,
 }: {
 	title: string;
@@ -2729,60 +3968,37 @@ function buildMercariAlertMessage({
 	url: string;
 	level: AlertLevel;
 	includeLastPrize: boolean;
+	topPrizeNames: string[];
 	marketContext: LatestMarketContext | null;
 }): string {
 	const safeRemaining = Number.isFinite(remaining) ? formatNumber(remaining as number) : "?";
 	const safeTotal = Number.isFinite(totalCount) ? formatNumber(totalCount as number) : "?";
-	const seed = hashSeed(`${title}|${url}|${level}|${safeRemaining}|${safeTotal}`);
-	const moodEmojiSets = ["😮‍💨😏👀", "🫥👁️", "😶‍🌫️😏", "😮‍💨🫠", "👁️🫰"];
-	const low5Lines = [
-		"静かに減ってる。",
-		"音はない。数だけ落ちる。",
-		"空気は冷たいまま、残りだけ削れる。",
-	];
-	const low1Lines = [
-		"もう余白は薄い。",
-		"ここから先は、遅れたらそれまで。",
-		"残りわずか。沈黙のまま終盤へ。",
-	];
-	const closePairs: Array<[string, string]> = [
-		["騒ぐ必要はない。", "取るやつだけが取る。"],
-		["群れる話じゃない。", "わかるやつだけ来い。"],
-		["静かでいい。", "遅れたら、それまで。🫰"],
-		["熱は内側で足りる。", "ここは、取る側の時間。"],
-	];
-	const mood = moodEmojiSets[seed % moodEmojiSets.length];
+	const headerEmoji = level === "under_1" ? "🚨" : "🎯";
 	const phaseLine =
 		level === "under_1"
-			? low1Lines[seed % low1Lines.length]
-			: low5Lines[seed % low5Lines.length];
-	const closePair = closePairs[seed % closePairs.length];
+			? "残りわずかです。気になる方は早めに確認してください。"
+			: "残りが少なくなってきました。気になる方はチェックしてください。";
 
 	const lines: string[] = [
-		`🎯メルカリくじ「${title}」${mood}`,
+		`${headerEmoji} メルカリくじ「${title}」`,
 		"",
-		`残り${safeRemaining}回 / 全${safeTotal}回`,
+		`残り${safeRemaining}回（全${safeTotal}回）`,
 		phaseLine,
 		"",
 	];
 	if (includeLastPrize) {
-		lines.push("🏆 ラスイチ賞を狙え", "");
+		const lastPrizeName = sanitizeCardNameForPost(topPrizeNames[0] ?? "").slice(0, 28).trim();
+		const targetLine = lastPrizeName
+			? `🏆 ラスイチ賞「${lastPrizeName}」を狙え`
+			: "🏆 ラスイチ賞を狙え";
+		lines.push(targetLine, "");
 	}
 	const marketLine = buildAlertMarketLine(marketContext);
 	if (marketLine) {
 		lines.push(marketLine, "");
 	}
-	lines.push(closePair[0], closePair[1], "", url);
+	lines.push(url);
 	return lines.join("\n");
-}
-
-function hashSeed(input: string): number {
-	let h = 2166136261 >>> 0;
-	for (let i = 0; i < input.length; i++) {
-		h ^= input.charCodeAt(i);
-		h = Math.imul(h, 16777619);
-	}
-	return h >>> 0;
 }
 
 function pickAlertMarketContext(
@@ -2816,6 +4032,7 @@ async function postTweetWithImages(
 		mainImageAlt?: string | null;
 		lastOneImageAlt?: string | null;
 		additionalImageUrls?: string[];
+		additionalImageAlts?: (string | null)[];
 	} = {},
 ): Promise<Record<string, unknown> & { ok: boolean }> {
 	const endpoint = "https://api.x.com/2/tweets";
@@ -2835,13 +4052,16 @@ async function postTweetWithImages(
 
 	const mediaIds: string[] = [];
 	const uploadedMedia: Array<Record<string, unknown>> = [];
+	let altAppliedCount = 0;
 
+	const additionalUrls = options.additionalImageUrls ?? [];
+	const additionalAlts = options.additionalImageAlts ?? [];
 	const imageCandidates: Array<{ url: string; altText: string | null }> = [
 		{ url: images.mainImageUrl || "", altText: options.mainImageAlt ?? null },
 		{ url: images.lastOneImageUrl || "", altText: options.lastOneImageAlt ?? null },
-		...(options.additionalImageUrls ?? []).map((url) => ({
+		...additionalUrls.map((url, i) => ({
 			url: String(url ?? ""),
-			altText: null,
+			altText: additionalAlts[i] ?? null,
 		})),
 	].filter((x) => Boolean(x.url));
 
@@ -2866,16 +4086,31 @@ async function postTweetWithImages(
 			};
 		}
 
-		const mediaId = String(uploadResult.mediaId);
-		mediaIds.push(mediaId);
-		if (candidate.altText && candidate.altText.trim()) {
-			const altResult = await setXMediaAltText(mediaId, candidate.altText.trim(), env);
-			uploadedMedia.push({
-				sourceUrl: imageUrl,
-				type: "alt_text",
-				...altResult,
-			});
+			const mediaId = String(uploadResult.mediaId);
+			mediaIds.push(mediaId);
+			if (candidate.altText && candidate.altText.trim()) {
+				const normalizedAltText = candidate.altText.trim();
+				const altResult = await setXMediaAltText(mediaId, normalizedAltText, env);
+				uploadedMedia.push({
+					sourceUrl: imageUrl,
+					type: "alt_text",
+					altText: normalizedAltText,
+					...altResult,
+				});
+				if (!altResult.ok) {
+					return {
+						ok: false,
+						status: altResult.status || 0,
+						error: "Image alt text failed",
+						uploadedMedia,
+					};
+				}
+				altAppliedCount += 1;
+			}
 		}
+
+	if (altAppliedCount > 0) {
+		await sleep(400);
 	}
 
 	const bodyObject: {
@@ -2916,12 +4151,87 @@ async function postTweetWithImages(
 		data = { raw };
 	}
 
+	if (!res.ok) {
+		const fallbackResult = await postTweetV1Fallback({
+			text,
+			mediaIds,
+			env,
+		});
+		if (fallbackResult.ok) {
+			return {
+				...fallbackResult,
+				mediaIds,
+				uploadedMedia,
+				fallbackUsed: true,
+			};
+		}
+		return {
+			ok: false,
+			status: res.status,
+			data,
+			mediaIds,
+			uploadedMedia,
+			fallbackUsed: true,
+			fallbackResponse: fallbackResult,
+		};
+	}
+
 	return {
 		ok: res.ok,
 		status: res.status,
 		data,
 		mediaIds,
 		uploadedMedia,
+	};
+}
+
+async function postTweetV1Fallback({
+	text,
+	mediaIds,
+	env,
+}: {
+	text: string;
+	mediaIds: string[];
+	env: MonitorEnv;
+}): Promise<Record<string, unknown> & { ok: boolean; status: number }> {
+	const endpointBase = "https://api.x.com/1.1/statuses/update.json";
+	const params = new URLSearchParams();
+	params.set("status", text);
+	if (mediaIds.length > 0) {
+		params.set("media_ids", mediaIds.join(","));
+	}
+	params.set("tweet_mode", "extended");
+	const endpoint = `${endpointBase}?${params.toString()}`;
+
+	const authorization = await buildOAuth1Header({
+		method: "POST",
+		url: endpoint,
+		consumerKey: env.X_API_KEY ?? "",
+		consumerSecret: env.X_API_KEY_SECRET ?? "",
+		token: env.X_ACCESS_TOKEN ?? "",
+		tokenSecret: env.X_ACCESS_TOKEN_SECRET ?? "",
+	});
+
+	const res = await fetch(endpoint, {
+		method: "POST",
+		headers: {
+			Authorization: authorization,
+		},
+	});
+
+	const raw = await res.text();
+	let data: unknown = null;
+	try {
+		data = JSON.parse(raw);
+	} catch {
+		data = { raw };
+	}
+
+	return {
+		ok: res.ok,
+		status: res.status,
+		data,
+		endpoint: endpointBase,
 	};
 }
 
@@ -3645,6 +4955,7 @@ async function getWatchlistEntries(stateStore: StateStore): Promise<WatchlistEnt
 				if (!sourceSite) return null;
 				const sourceUrl = String((item as { sourceUrl?: string }).sourceUrl ?? "").trim();
 				if (!sourceUrl) return null;
+				if (sourceSite === "snkrdunk" && !isLikelyPokemonCardLabel(cardName)) return null;
 				const currentPrice = Number((item as { currentPrice?: number }).currentPrice ?? afterPrice);
 				if (!Number.isFinite(currentPrice) || currentPrice <= 0) return null;
 				const priceHistory = normalizeWatchPriceHistory((item as { priceHistory?: unknown }).priceHistory);
@@ -4445,6 +5756,11 @@ function buildMercariDailyImageAlt(
 			? `残り${formatNumber(remaining as number)}回（全${formatNumber(totalCount)}回）`
 			: "販売中";
 	return `${title} | 1等候補: ${topPrizeText} | ${remainText}`.slice(0, 1000);
+}
+
+function buildThresholdAlertImageAlt(title: string, topPrizeNames: string[]): string {
+	const prizeText = topPrizeNames.length > 0 ? topPrizeNames.slice(0, 3).join(" / ") : "未取得";
+	return `${title} | ラスト賞: ${prizeText}`.slice(0, 1000);
 }
 
 function scoreMercariImageUrl(url: string): number {
