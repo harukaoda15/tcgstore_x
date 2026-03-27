@@ -271,6 +271,10 @@ type MonitorEnv = Env & {
 	X_AUTO_LIKE_AI_DAILY_LIMIT?: string;
 	X_AUTO_LIKE_AI_MAX_PER_RUN?: string;
 	X_AUTO_LIKE_AI_MODEL?: string;
+	DUNE_API_KEY?: string;
+	DUNE_POKEMON_SOL_ENABLED?: string;
+	DUNE_POKEMON_SOL_QUERY_IDS?: string;
+	DUNE_POKEMON_SOL_DASHBOARD_URL?: string;
 };
 
 type StateStore = {
@@ -367,6 +371,9 @@ const X_AUTO_LIKE_COMMERCIAL_KEYWORDS = [
 	"未開封BOX売",
 	"オリパ販売",
 ];
+const DUNE_POKEMON_SOL_DAILY_PREFIX = "dune_pokemontcgsol:";
+const DUNE_POKEMON_SOL_LATEST_KEY = "dune_pokemontcgsol_latest";
+const DUNE_POKEMON_SOL_DEFAULT_DASHBOARD_URL = "https://dune.com/zkayape/pokemontcgsol";
 const DAILY_RECENT_HISTORY_LIMIT = 10;
 const ALERT_MARKET_CHANGE_PCT_MIN = 8;
 const FAST_MONITOR_WINDOW_MS = 1000 * 60 * 90;
@@ -655,6 +662,32 @@ export default {
 			});
 			return jsonResponse(result);
 		}
+		if (mode === "dune_pokeca_preview") {
+			const result = await runDunePokemonSolSnapshot(env, {
+				commit: false,
+				logToConsole: true,
+				fromSchedule: false,
+			});
+			return jsonResponse(result);
+		}
+		if (mode === "dune_pokeca_fetch") {
+			const result = await runDunePokemonSolSnapshot(env, {
+				commit: reqUrl.searchParams.get("commit") === "1",
+				logToConsole: true,
+				fromSchedule: false,
+			});
+			return jsonResponse(result);
+		}
+		if (mode === "dune_pokeca_latest") {
+			const stateStore = createStateStore(env);
+			const raw = await stateStore.get(DUNE_POKEMON_SOL_LATEST_KEY);
+			if (!raw) return jsonResponse({ ok: false, reason: "dune_snapshot_not_found" });
+			try {
+				return jsonResponse({ ok: true, latest: JSON.parse(raw) });
+			} catch {
+				return jsonResponse({ ok: false, reason: "dune_snapshot_parse_failed" });
+			}
+		}
 
 		return runMonitor(request, env, {
 			fromSchedule: false,
@@ -730,6 +763,13 @@ export default {
 		}
 		if (isThirtyMinuteTick) {
 			await runXAutoLike(env, {
+				commit: true,
+				logToConsole: true,
+				fromSchedule: true,
+			});
+		}
+		if (isDunePokemonSolFetchCron(event)) {
+			await runDunePokemonSolSnapshot(env, {
 				commit: true,
 				logToConsole: true,
 				fromSchedule: true,
@@ -924,6 +964,160 @@ function isPokecaSummaryFetchCron(event: ScheduledEvent): boolean {
 
 function isPokecaSummaryPostCron(event: ScheduledEvent): boolean {
 	return event.cron === "0 12 * * *";
+}
+
+function isDunePokemonSolFetchCron(event: ScheduledEvent): boolean {
+	return event.cron === "0 3 * * *";
+}
+
+function isDunePokemonSolEnabled(env: MonitorEnv): boolean {
+	return parseBooleanEnv(env.DUNE_POKEMON_SOL_ENABLED, true);
+}
+
+function resolveDunePokemonSolDashboardUrl(env: MonitorEnv): string {
+	const custom = String(env.DUNE_POKEMON_SOL_DASHBOARD_URL ?? "").trim();
+	return custom || DUNE_POKEMON_SOL_DEFAULT_DASHBOARD_URL;
+}
+
+function resolveDunePokemonSolQueryIds(env: MonitorEnv): number[] {
+	const raw = String(env.DUNE_POKEMON_SOL_QUERY_IDS ?? "").trim();
+	if (!raw) return [];
+	const ids = raw
+		.split(",")
+		.map((v) => Number(String(v).trim()))
+		.filter((v) => Number.isFinite(v) && v > 0)
+		.map((v) => Math.trunc(v));
+	return [...new Set(ids)];
+}
+
+function getDunePokemonSolDailyKey(dateKey: string): string {
+	return `${DUNE_POKEMON_SOL_DAILY_PREFIX}${dateKey}`;
+}
+
+async function fetchDuneLatestQueryResult(
+	queryId: number,
+	apiKey: string,
+): Promise<{
+	ok: boolean;
+	status: number;
+	rows: Array<Record<string, unknown>>;
+	response?: unknown;
+	error?: string;
+}> {
+	const endpoint = `https://api.dune.com/api/v1/query/${queryId}/results?limit=1000`;
+	const res = await fetch(endpoint, {
+		method: "GET",
+		headers: {
+			"x-dune-api-key": apiKey,
+			accept: "application/json",
+		},
+	});
+	const raw = await res.text();
+	let data: unknown = null;
+	try {
+		data = raw ? JSON.parse(raw) : {};
+	} catch {
+		data = { raw };
+	}
+	if (!res.ok) {
+		return {
+			ok: false,
+			status: res.status,
+			rows: [],
+			response: data,
+			error: `dune_http_${res.status}`,
+		};
+	}
+	const body = data as {
+		result?: { rows?: Array<Record<string, unknown>> };
+		rows?: Array<Record<string, unknown>>;
+	};
+	const rows = Array.isArray(body?.result?.rows)
+		? body.result.rows
+		: Array.isArray(body?.rows)
+			? body.rows
+			: [];
+	return {
+		ok: true,
+		status: res.status,
+		rows,
+		response: data,
+	};
+}
+
+async function runDunePokemonSolSnapshot(
+	env: MonitorEnv,
+	options: { commit?: boolean; logToConsole?: boolean; fromSchedule?: boolean } = {},
+): Promise<Record<string, unknown>> {
+	const { commit = false, logToConsole = true, fromSchedule = false } = options;
+	const enabled = isDunePokemonSolEnabled(env);
+	if (!enabled) {
+		const result = { ok: false, reason: "dune_pokeca_disabled", commitMode: commit, fromSchedule };
+		if (logToConsole) console.log(JSON.stringify({ type: "DUNE_POKECA_SKIP", ...result }, null, 2));
+		return result;
+	}
+	if (!env.DUNE_API_KEY) {
+		const result = { ok: false, reason: "missing_dune_api_key", commitMode: commit, fromSchedule };
+		if (logToConsole) console.log(JSON.stringify({ type: "DUNE_POKECA_SKIP", ...result }, null, 2));
+		return result;
+	}
+	const queryIds = resolveDunePokemonSolQueryIds(env);
+	if (queryIds.length === 0) {
+		const result = {
+			ok: false,
+			reason: "missing_dune_query_ids",
+			commitMode: commit,
+			fromSchedule,
+			dashboardUrl: resolveDunePokemonSolDashboardUrl(env),
+			note: "DUNE_POKEMON_SOL_QUERY_IDS にカンマ区切りで query id を設定してください",
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "DUNE_POKECA_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const fetchResults: Array<Record<string, unknown>> = [];
+	let totalRows = 0;
+	for (const queryId of queryIds) {
+		const fetched = await fetchDuneLatestQueryResult(queryId, env.DUNE_API_KEY);
+		totalRows += fetched.rows.length;
+		fetchResults.push({
+			queryId,
+			ok: fetched.ok,
+			status: fetched.status,
+			rowCount: fetched.rows.length,
+			sampleKeys: fetched.rows[0] ? Object.keys(fetched.rows[0]).slice(0, 12) : [],
+			error: fetched.error ?? null,
+		});
+	}
+	const successCount = fetchResults.filter((r) => r.ok === true).length;
+	const now = new Date();
+	const dateKey = getJstYmd(now);
+	const snapshot = {
+		dateKey,
+		fetchedAt: now.toISOString(),
+		dashboardUrl: resolveDunePokemonSolDashboardUrl(env),
+		queryIds,
+		successCount,
+		totalQueries: queryIds.length,
+		totalRows,
+		queries: fetchResults,
+	};
+
+	if (commit) {
+		const stateStore = createStateStore(env);
+		await stateStore.put(getDunePokemonSolDailyKey(dateKey), JSON.stringify(snapshot));
+		await stateStore.put(DUNE_POKEMON_SOL_LATEST_KEY, JSON.stringify(snapshot));
+	}
+
+	const result = {
+		ok: successCount > 0,
+		commitMode: commit,
+		fromSchedule,
+		committed: commit && successCount > 0,
+		...snapshot,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "DUNE_POKECA_RESULT", ...result }, null, 2));
+	return result;
 }
 
 async function runPokecaSummaryDailySnapshotFetch(
