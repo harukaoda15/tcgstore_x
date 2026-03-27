@@ -2240,7 +2240,13 @@ async function choosePokecaRankTargetByAi(
 	env: MonitorEnv,
 	stateStore: StateStore,
 	now: Date,
-): Promise<{ ok: boolean; rankTarget?: PokecaRankTarget; reason?: string; model?: string | null }> {
+): Promise<{
+	ok: boolean;
+	rankTarget?: PokecaRankTarget;
+	reason?: string;
+	model?: string | null;
+	historyGuardApplied?: boolean;
+}> {
 	if (!isPokecaSummaryAiEnabled(env)) return { ok: false, reason: "pokeca_summary_ai_disabled", model: null };
 	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key", model: null };
 	const model = resolvePokecaSummaryModel(env);
@@ -2273,7 +2279,17 @@ async function choosePokecaRankTargetByAi(
 	if (!response.ok || !response.text) return { ok: false, reason: response.reason ?? "anthropic_failed", model };
 	const picked = parsePokecaRankTarget(String(response.text).trim().split(/\s+/)[0] ?? "");
 	if (!picked) return { ok: false, reason: "ai_theme_parse_failed", model };
-	return { ok: true, rankTarget: picked, model };
+	// 直近で上昇/下落系が続いている場合は、取引件数テーマへ寄せて連投感を避ける。
+	const recentDirectionalCount = history
+		.slice(0, 3)
+		.filter((v) => v === "rank_rise_7" || v === "rank_fall_7").length;
+	if (
+		recentDirectionalCount >= 2 &&
+		(picked === "rank_rise_7" || picked === "rank_fall_7")
+	) {
+		return { ok: true, rankTarget: "rank_vol", model, historyGuardApplied: true };
+	}
+	return { ok: true, rankTarget: picked, model, historyGuardApplied: false };
 }
 
 function getPokecaRankLabel(rank: PokecaRankTarget): string {
@@ -2623,9 +2639,9 @@ async function renderPokecaBannerViaSvgResvg(
 	const logoDataUrl = `data:image/svg+xml;base64,${utf8ToBase64(TCGSTORE_LOGO_SVG)}`;
 
 	const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="600" height="574" viewBox="0 0 600 574">
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="459" viewBox="0 0 600 459">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="600" y2="574" gradientUnits="userSpaceOnUse">
+    <linearGradient id="bg" x1="0" y1="0" x2="600" y2="459" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FF732E"/>
       <stop offset="52%" stop-color="#FA4573"/>
       <stop offset="100%" stop-color="#5E54F2"/>
@@ -2641,10 +2657,10 @@ async function renderPokecaBannerViaSvgResvg(
     </filter>
     ${clipDefs}
   </defs>
-  <rect x="0" y="0" width="600" height="574" fill="url(#bg)"/>
+  <rect x="0" y="0" width="600" height="459" fill="url(#bg)"/>
   <ellipse cx="50" cy="20" rx="90" ry="90" fill="rgba(255,242,115,0.45)" filter="url(#blur12)"/>
   <ellipse cx="345" cy="55" rx="95" ry="95" fill="rgba(89,242,255,0.35)" filter="url(#blur15)"/>
-  <ellipse cx="235" cy="560" rx="115" ry="90" fill="rgba(255,115,191,0.28)" filter="url(#blur14)"/>
+  <ellipse cx="235" cy="430" rx="115" ry="90" fill="rgba(255,115,191,0.28)" filter="url(#blur14)"/>
   <rect x="20" y="18" width="549" height="86" rx="18" ry="18" fill="rgba(40,0,81,0.17)" stroke="rgba(255,255,255,0.36)"/>
   <text x="300" y="54" fill="#FFFFFF" text-anchor="middle" font-size="25" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">${escapeXmlText(title || "フリマ取引件数ランキング")}</text>
   <text x="300" y="82" fill="#FFF7D1" text-anchor="middle" font-size="15" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">注目カードはこちら！</text>
@@ -2723,7 +2739,7 @@ async function buildPokecaSummaryCollageImage(
 		const scale = 2;
 		const sx = (v: number) => Math.round(v * scale);
 		const width = sx(600);
-		const height = sx(574);
+		const height = sx(459);
 		const canvas = new OffscreenCanvasCtor(width, height);
 		const ctx = canvas.getContext("2d");
 		if (!ctx) return null;
@@ -3228,16 +3244,14 @@ function buildPokecaSummaryOriginalMessage(
 	const prevDateKey = String(options.prevDateKey ?? "").trim();
 	const dateKey = String(options.dateKey ?? "").trim();
 
-	if (prevCards.length > 0 && prevDateKey && dateKey) {
+	if (rankTarget !== "rank_vol" && prevCards.length > 0 && prevDateKey && dateKey) {
 		const deltaEntries = buildPokecaDailyDeltaEntries(cards, prevCards, rankTarget).slice(0, 3);
 		if (deltaEntries.length >= 3) {
 			const periodLine = `${formatYmdMonthDay(prevDateKey)}→${formatYmdMonthDay(dateKey)}`;
 			const title =
 				rankTarget === "rank_fall_7"
 					? "前日比下落額ランキング TOP3"
-					: rankTarget === "rank_vol"
-						? "前日比変動額ランキング TOP3"
-						: "前日比上昇額ランキング TOP3";
+					: "前日比上昇額ランキング TOP3";
 			const lines = [
 				`【ポケカ${title}】`,
 				periodLine,
