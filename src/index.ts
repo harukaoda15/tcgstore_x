@@ -3767,6 +3767,8 @@ async function runPokecaSummary(
 			// keep base candidates
 		}
 	}
+	// 前日比テンプレの連投を避けるため、d1_系は自動選出から除外する。
+	originalCandidates = originalCandidates.filter((candidate) => !candidate.key.startsWith("d1_"));
 	let selectedOriginalCandidate: PokecaOriginalCandidate | null = null;
 	if (originalCandidates.length > 0) {
 		const lastFingerprint = String((await stateStore.get(POKECA_SUMMARY_LAST_POST_FINGERPRINT_KEY)) ?? "").trim();
