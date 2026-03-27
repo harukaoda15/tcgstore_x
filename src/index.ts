@@ -290,6 +290,7 @@ const POKECA_SUMMARY_DAILY_PREFIX = "pokeca_summary:";
 const POKECA_SUMMARY_THEME_HISTORY_KEY = "pokeca_summary_theme_history";
 const POKECA_SUMMARY_ORIGINAL_THEME_HISTORY_KEY = "pokeca_summary_original_theme_history";
 const POKECA_SUMMARY_LAST_POST_FINGERPRINT_KEY = "pokeca_summary:last_post_fingerprint";
+const POKECA_SUMMARY_LAST_VOL_VARIANT_KEY = "pokeca_summary:last_vol_variant";
 const POKECA_CHART_API_URL = "https://pokeca-chart.com/ch/api/v1/item";
 const POKECA_CHART_URL_ORIGIN = "https://pokeca-chart.com/";
 const POKECA_CHART_PASS_PHRASE_HEAD = "vQpUc4ej";
@@ -3045,7 +3046,11 @@ function mergePokecaCardsUnique(cardGroups: PokecaSummaryCard[][]): PokecaSummar
 	return [...merged.values()];
 }
 
-function buildPokecaOriginalCandidateMessage(candidate: PokecaOriginalCandidate): { text: string; displayedCount: number } {
+function buildPokecaOriginalCandidateMessage(candidate: PokecaOriginalCandidate): {
+	text: string;
+	displayedCount: number;
+	variantKey?: string;
+} {
 	const rows = candidate.rows.slice(0, 3);
 	const lines = [
 		`【ポケカ${candidate.label}】`,
@@ -3243,8 +3248,9 @@ function buildPokecaSummaryOriginalMessage(
 		prevCards?: PokecaSummaryCard[];
 		prevDateKey?: string;
 		dateKey?: string;
+		volVariantOffset?: number;
 	} = {},
-): { text: string; displayedCount: number } {
+): { text: string; displayedCount: number; variantKey?: string } {
 	const topCards = cards.slice(0, Math.min(3, cards.length));
 	const displayedCount = topCards.length;
 	const dateLabel = formatJstDateLabel(now);
@@ -3253,6 +3259,52 @@ function buildPokecaSummaryOriginalMessage(
 	const prevCards = Array.isArray(options.prevCards) ? options.prevCards : [];
 	const prevDateKey = String(options.prevDateKey ?? "").trim();
 	const dateKey = String(options.dateKey ?? "").trim();
+	const volVariantOffset = Math.trunc(Number(options.volVariantOffset ?? 0));
+
+	if (rankTarget === "rank_vol" && cards.length >= 3) {
+		const basePool = cards.slice(0, Math.min(10, cards.length));
+		const highPricePool = [...basePool].sort((a, b) => b.price - a.price).slice(0, 3);
+		const lowPricePool = [...basePool].sort((a, b) => a.price - b.price).slice(0, 3);
+		const variants: Array<{
+			key: "trade_count" | "high_price" | "low_price";
+			title: string;
+			lead: string;
+			rows: PokecaSummaryCard[];
+		}> = [
+			{
+				key: "trade_count",
+				title: "取引件数ランキング TOP3",
+				lead: "👀 取引が集まった銘柄に注目",
+				rows: basePool.slice(0, 3),
+			},
+			{
+				key: "high_price",
+				title: "高価格帯 取引注目 TOP3",
+				lead: "💎 高価格帯で動きが目立った銘柄",
+				rows: highPricePool,
+			},
+			{
+				key: "low_price",
+				title: "お手頃価格帯 取引注目 TOP3",
+				lead: "🪙 手に取りやすい価格帯で動いた銘柄",
+				rows: lowPricePool,
+			},
+		];
+		const jst = getJstNow(now);
+		const daySeed = jst.getUTCFullYear() * 10000 + (jst.getUTCMonth() + 1) * 100 + jst.getUTCDate();
+		const selected = variants[Math.abs(daySeed + volVariantOffset) % variants.length] ?? variants[0];
+		const lines = [
+			`【ポケカ${selected.title}】`,
+			collectedLine,
+			selected.lead,
+			...selected.rows.map(
+				(card, idx) => `${idx + 1}. ${stripPokecaCardVariant(card.cardName)} ${formatNumber(card.price)}円`,
+			),
+			"",
+			"#ポケカ",
+		];
+		return { text: lines.join("\n"), displayedCount: selected.rows.length, variantKey: selected.key };
+	}
 
 	if (rankTarget !== "rank_vol" && prevCards.length > 0 && prevDateKey && dateKey) {
 		const deltaEntries = buildPokecaDailyDeltaEntries(cards, prevCards, rankTarget).slice(0, 3);
@@ -3813,14 +3865,33 @@ async function runPokecaSummary(
 			}
 		}
 	}
-	const built = selectedOriginalCandidate
+	const lastVolVariant = rankTarget === "rank_vol"
+		? String((await stateStore.get(POKECA_SUMMARY_LAST_VOL_VARIANT_KEY)) ?? "").trim()
+		: "";
+	let built = selectedOriginalCandidate
 		? buildPokecaOriginalCandidateMessage(selectedOriginalCandidate)
 		: buildPokecaSummaryOriginalMessage(rankedCards, rankLabel, rankTarget, now, {
 				consecutiveLine,
 				prevCards: previousCards,
 				prevDateKey: comparisonDateKey,
 				dateKey,
+				volVariantOffset: 0,
 		  });
+	if (
+		!selectedOriginalCandidate &&
+		rankTarget === "rank_vol" &&
+		lastVolVariant &&
+		built.variantKey &&
+		built.variantKey === lastVolVariant
+	) {
+		built = buildPokecaSummaryOriginalMessage(rankedCards, rankLabel, rankTarget, now, {
+			consecutiveLine,
+			prevCards: previousCards,
+			prevDateKey: comparisonDateKey,
+			dateKey,
+			volVariantOffset: 1,
+		});
+	}
 	let message = built.text;
 	const displayedCount = built.displayedCount;
 	let postCards = rankedCards;
@@ -3912,6 +3983,9 @@ async function runPokecaSummary(
 					POKECA_SUMMARY_LAST_POST_FINGERPRINT_KEY,
 					buildPokecaCandidateFingerprint(selectedOriginalCandidate),
 				);
+			}
+			if (!selectedOriginalCandidate && rankTarget === "rank_vol" && built.variantKey) {
+				await stateStore.put(POKECA_SUMMARY_LAST_VOL_VARIANT_KEY, built.variantKey);
 			}
 		}
 	}
