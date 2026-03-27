@@ -1,3 +1,6 @@
+import { initWasm as initResvgWasm, Resvg } from "@resvg/resvg-wasm";
+import resvgWasmBinary from "@resvg/resvg-wasm/index_bg.wasm";
+
 type AlertLevel = "under_5" | "under_1";
 type MonitorSource = "mercari" | "tcgstore";
 
@@ -22,6 +25,24 @@ type DailyMercariOptions = {
 	logToConsole?: boolean;
 	fromSchedule?: boolean;
 	pickOffset?: number;
+};
+
+type StreamScheduleOptions = {
+	commit?: boolean;
+	logToConsole?: boolean;
+	fromSchedule?: boolean;
+	targetDate?: string | null;
+	daysAhead?: number | null;
+	respectPostWindow?: boolean;
+	force?: boolean;
+	now?: Date;
+};
+
+type XAutoLikeOptions = {
+	commit?: boolean;
+	logToConsole?: boolean;
+	fromSchedule?: boolean;
+	maxLikesPerRun?: number | null;
 };
 
 type DailyTcgPreviewOptions = {
@@ -54,14 +75,11 @@ type PriceSpikeItem = {
 	history_prices?: Array<{ date: string; price: number }>;
 };
 
-type PriceSpikePayload = {
-	source: string;
-	spikes: PriceSpikeItem[];
-};
-
 type PokecaSummaryCard = {
 	cardName: string;
 	price: number;
+	riseFallRate7: number | null;
+	riseFallPrice7: number | null;
 	imageUrl: string | null;
 	imageR2Key?: string | null;
 	url: string;
@@ -77,9 +95,59 @@ type PokecaSummarySnapshot = {
 	snapshotFetchedAt: string;
 };
 
+type PokecaConsecutiveRankIn = {
+	cardName: string;
+	todayRank: number;
+	yesterdayRank: number;
+};
+
+type PokecaDailyDeltaEntry = {
+	cardName: string;
+	todayPrice: number;
+	yesterdayPrice: number;
+	deltaPrice: number;
+	deltaPct: number;
+};
+
+type PokecaOriginalCandidate = {
+	key: string;
+	label: string;
+	periodLine: string;
+	rows: PokecaDailyDeltaEntry[];
+};
+
+function buildPokecaCandidateFingerprint(candidate: PokecaOriginalCandidate): string {
+	const rows = candidate.rows
+		.slice(0, 3)
+		.map((r) => `${stripPokecaCardVariant(r.cardName)}:${Math.round(r.todayPrice)}:${Math.round(r.deltaPrice)}`)
+		.join("|");
+	return `${candidate.key}|${candidate.periodLine}|${rows}`;
+}
+
+type StreamScheduleEntry = {
+	rowNumber: number;
+	dateKey: string;
+	startAt: string;
+	sortTimeValue: number | null;
+	timeLabel: string;
+	title: string;
+	note: string | null;
+	url: string | null;
+	imageUrl: string | null;
+};
+
+type StreamScheduleParseResult = {
+	ok: boolean;
+	headers: string[];
+	entries: StreamScheduleEntry[];
+	missingHeaders: string[];
+	skippedRows: Array<{ rowNumber: number; reason: string }>;
+};
+
 type PokecaApiPriceInfo = {
 	nPriceRecent?: number;
 	fRiseFallRate7?: number;
+	nRiseFallPrice7?: number;
 };
 
 type PokecaApiItem = {
@@ -151,6 +219,7 @@ type ItemDetail = {
 	hasLastOnePrize: boolean;
 	detailTextHint: string;
 	topPrizeNames: string[];
+	lastOnePrizeName: string | null;
 	mainImageUrl: string | null;
 	lastOneImageUrl: string | null;
 	imageUrls: string[];
@@ -163,6 +232,14 @@ type PickedTitle = {
 	source: string;
 };
 
+type XAutoLikeState = {
+	dateKey: string;
+	count: number;
+	likedIds: string[];
+	likedAuthorIds: string[];
+	aiChecks: number;
+};
+
 type MonitorEnv = Env & {
 	STATE?: KVNamespace;
 	POKECA_IMAGE_ARCHIVE?: R2Bucket;
@@ -172,10 +249,28 @@ type MonitorEnv = Env & {
 	X_ACCESS_TOKEN_SECRET?: string;
 	ANTHROPIC_API_KEY?: string;
 	ANTHROPIC_MODEL?: string;
-	PRICE_SPIKE_USE_AI?: string;
 	MARKET_SUMMARY_USE_AI?: string;
 	MARKET_SUMMARY_MODEL?: string;
 	POKECA_ARCHIVE_IMAGES?: string;
+	POKECA_SUMMARY_USE_AI?: string;
+	POKECA_SUMMARY_MODEL?: string;
+	POKECA_SUMMARY_TEMPLATE_IMAGE_URL?: string;
+	STREAM_SCHEDULE_CSV_URL?: string;
+	STREAM_SCHEDULE_POST_HOUR_JST?: string;
+	STREAM_SCHEDULE_LOOKAHEAD_DAYS?: string;
+	STREAM_SCHEDULE_HEADER?: string;
+	STREAM_SCHEDULE_FOOTER?: string;
+	STREAM_SCHEDULE_HASHTAGS?: string;
+	STREAM_SCHEDULE_LINK_URL?: string;
+	STREAM_SCHEDULE_IMAGE_URL?: string;
+	X_AUTO_LIKE_ENABLED?: string;
+	X_AUTO_LIKE_DAILY_LIMIT?: string;
+	X_AUTO_LIKE_QUERY?: string;
+	X_AUTO_LIKE_MAX_PER_RUN?: string;
+	X_AUTO_LIKE_AI_ENABLED?: string;
+	X_AUTO_LIKE_AI_DAILY_LIMIT?: string;
+	X_AUTO_LIKE_AI_MAX_PER_RUN?: string;
+	X_AUTO_LIKE_AI_MODEL?: string;
 };
 
 type StateStore = {
@@ -190,18 +285,87 @@ const TCGSTORE_RECENT_URLS_KEY = "recent_oripa_urls";
 const MERCARI_RECENT_URLS_KEY = "recent_mercari_urls";
 const DAILY_LAST_SOURCE_KEY = "last_daily_source";
 const LATEST_MARKET_CONTEXT_KEY = "latest_market_context";
-const PRICE_SPIKE_AUDIT_KEY = "price_spike_audit";
 const FAST_MONITOR_UNTIL_KEY = "fast_monitor_until";
 const POKECA_SUMMARY_DAILY_PREFIX = "pokeca_summary:";
+const POKECA_SUMMARY_THEME_HISTORY_KEY = "pokeca_summary_theme_history";
+const POKECA_SUMMARY_ORIGINAL_THEME_HISTORY_KEY = "pokeca_summary_original_theme_history";
+const POKECA_SUMMARY_LAST_POST_FINGERPRINT_KEY = "pokeca_summary:last_post_fingerprint";
 const POKECA_CHART_API_URL = "https://pokeca-chart.com/ch/api/v1/item";
 const POKECA_CHART_URL_ORIGIN = "https://pokeca-chart.com/";
 const POKECA_CHART_PASS_PHRASE_HEAD = "vQpUc4ej";
 const POKECA_POST_RANK_LIMIT = 10;
 const POKECA_SNAPSHOT_TOP_LIMIT = 50;
 const POKECA_SNAPSHOT_RANK_TARGETS: PokecaRankTarget[] = ["rank_rise_7", "rank_fall_7", "rank_vol"];
-const POKECA_POST_IMAGE_LIMIT = 3;
+const POKECA_POST_IMAGE_LIMIT = 1;
 const POKECA_TWEET_TEXT_LIMIT = 280;
 const POKECA_SUMMARY_RETENTION_DAYS = 90;
+const X_AUTO_LIKE_STATE_PREFIX = "x_auto_like_state:";
+const X_AUTO_LIKE_DEFAULT_DAILY_LIMIT = 24;
+const X_AUTO_LIKE_DEFAULT_MAX_PER_RUN = 1;
+const X_AUTO_LIKE_AI_DEFAULT_DAILY_LIMIT = 8;
+const X_AUTO_LIKE_AI_DEFAULT_MAX_PER_RUN = 2;
+const X_AUTO_LIKE_AI_DEFAULT_MODEL = "claude-3-5-haiku-latest";
+const X_AUTO_LIKE_NEW_ACCOUNT_DAYS = 21;
+const X_AUTO_LIKE_DEFAULT_QUERY =
+	"(ポケカ OR ポケモンカード) (開封 OR 当たった OR 嬉しい OR うれしい OR 引けた OR 買えた OR ゲット) -買取 -販売 -入荷 -予約 -在庫 -PR -キャンペーン -is:retweet -is:reply lang:ja";
+const X_AUTO_LIKE_POSITIVE_KEYWORDS = [
+	"嬉しい",
+	"うれしい",
+	"神引き",
+	"最高",
+	"楽しい",
+	"感謝",
+	"ありがとうございます",
+	"好き",
+	"可愛い",
+	"かっこいい",
+	"優勝",
+	"大満足",
+	"届いた",
+	"開封",
+	"ゲット",
+	"買えた",
+	"当たった",
+	"激アツ",
+];
+const X_AUTO_LIKE_NEGATIVE_KEYWORDS = [
+	"高すぎ",
+	"高過ぎ",
+	"詐欺",
+	"最悪",
+	"爆死",
+	"引退",
+	"損した",
+	"炎上",
+	"偽物",
+	"転売ヤー",
+	"ムカつく",
+	"むかつく",
+	"うざい",
+	"萎え",
+	"しんどい",
+	"苦しい",
+	"きつい",
+	"最悪すぎ",
+	"最悪過ぎ",
+];
+const X_AUTO_LIKE_COMMERCIAL_KEYWORDS = [
+	"買取",
+	"販売",
+	"入荷",
+	"予約",
+	"在庫",
+	"宣伝",
+	"PR",
+	"キャンペーン",
+	"プレゼント企画",
+	"送料無料",
+	"店舗",
+	"通販",
+	"鑑定品",
+	"未開封BOX売",
+	"オリパ販売",
+];
 const DAILY_RECENT_HISTORY_LIMIT = 10;
 const ALERT_MARKET_CHANGE_PCT_MIN = 8;
 const FAST_MONITOR_WINDOW_MS = 1000 * 60 * 90;
@@ -212,6 +376,11 @@ const ALERT_THRESHOLDS: Record<MonitorSource, { low: number; high: number; unit:
 const WATCHLIST_KEY = "watchlist";
 const WATCHLIST_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const WATCHLIST_LIMIT = 20;
+const STREAM_SCHEDULE_POSTED_PREFIX = "stream_schedule_posted:";
+const STREAM_SCHEDULE_DEFAULT_POST_HOUR_JST = 9;
+const STREAM_SCHEDULE_DEFAULT_LOOKAHEAD_DAYS = 0;
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+const JST_WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"] as const;
 const MARKET_SUMMARY_MIN_POOL = 3;
 const SNKRDUNK_SEED_FALLBACK_IDS: string[] = [];
 const DAILY_SPOTLIGHT_ENABLED = false;
@@ -272,13 +441,6 @@ const SPECIAL_ITEM_FACTS: Record<string, string> = {
 		"この商品は1人1回限定で、最低10000coin以上が当たる訴求を最優先。赤字覚悟・新規向けの強い訴求を使ってよい。",
 };
 
-const PRICE_SPIKE_SYSTEM_PROMPT = `あなたはポケカ好きな情報通。市場をよく見ている人が、
-フォロワーにさらっと共有するトーンで書く。
-- 誇張しない
-- 数字は正確に
-- 温度はあるが煽らない
-- 断定予測はしない`;
-
 const MARKET_SUMMARY_SYSTEM_PROMPT = `あなたはポケカ市場情報を簡潔に共有する編集者です。
 
 ## 投稿フォーマット（厳守）
@@ -292,7 +454,11 @@ const MARKET_SUMMARY_SYSTEM_PROMPT = `あなたはポケカ市場情報を簡潔
 - 3〜5件まとめる
 - 煽り・断定・予測禁止`;
 const DEFAULT_MARKET_SUMMARY_MODEL = "claude-3-5-haiku-latest";
-const PRICE_SPIKE_AUDIT_LIMIT = 100;
+const DEFAULT_POKECA_SUMMARY_MODEL = "claude-3-5-haiku-latest";
+
+let resvgWasmInitPromise: Promise<boolean> | null = null;
+let lastPokecaCollageDebugReason: string | null = null;
+let pokecaBannerFontBuffersPromise: Promise<Uint8Array[]> | null = null;
 
 const MERCARI_DAILY_AI_SYSTEM_PROMPT = `あなたはTCGSTOREのX運用担当。
 メルカリくじの紹介投稿を作るが、広告っぽさよりも「読む価値」を優先する。
@@ -305,6 +471,9 @@ export default {
 	async fetch(request: Request, env: MonitorEnv): Promise<Response> {
 		const reqUrl = new URL(request.url);
 		const mode = reqUrl.searchParams.get("mode");
+		if (mode === "price_spike" || mode === "price_spike_audit") {
+			return jsonResponse({ ok: false, reason: "price_spike_mode_removed" });
+		}
 		if (mode === "tcg_samples") {
 			const countRaw = Number(reqUrl.searchParams.get("count") ?? "5");
 			const result = await runDailyTcgStoreSamples(env, {
@@ -358,18 +527,6 @@ export default {
 			});
 			return jsonResponse(result);
 		}
-		if (mode === "price_spike") {
-			const commit = reqUrl.searchParams.get("commit") === "1";
-			const result = await runPriceSpikeMode(request, env, { commit, logToConsole: true });
-			return jsonResponse(result);
-		}
-		if (mode === "price_spike_audit") {
-			const stateStore = createStateStore(env);
-			const limitRaw = Number(reqUrl.searchParams.get("limit") ?? "30");
-			const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, Math.trunc(limitRaw))) : 30;
-			const audit = await getPriceSpikeAudit(stateStore, limit);
-			return jsonResponse({ ok: true, total: audit.length, audit });
-		}
 		if (mode === "market_summary") {
 			const commit = reqUrl.searchParams.get("commit") === "1";
 			const result = await runMarketSummary(env, {
@@ -387,9 +544,39 @@ export default {
 			});
 			return jsonResponse(result);
 		}
+		if (mode === "stream_schedule_preview") {
+			const daysAheadRaw = Number(reqUrl.searchParams.get("days_ahead"));
+			const daysAhead = Number.isFinite(daysAheadRaw) ? Math.trunc(daysAheadRaw) : null;
+			const targetDate = reqUrl.searchParams.get("target_date");
+			const result = await runStreamScheduleDailyDigest(env, {
+				commit: false,
+				logToConsole: true,
+				fromSchedule: false,
+				targetDate,
+				daysAhead,
+			});
+			return jsonResponse(result);
+		}
+		if (mode === "stream_schedule") {
+			const commit = reqUrl.searchParams.get("commit") === "1";
+			const force = reqUrl.searchParams.get("force") === "1";
+			const daysAheadRaw = Number(reqUrl.searchParams.get("days_ahead"));
+			const daysAhead = Number.isFinite(daysAheadRaw) ? Math.trunc(daysAheadRaw) : null;
+			const targetDate = reqUrl.searchParams.get("target_date");
+			const result = await runStreamScheduleDailyDigest(env, {
+				commit,
+				logToConsole: true,
+				fromSchedule: false,
+				targetDate,
+				daysAhead,
+				force,
+			});
+			return jsonResponse(result);
+		}
 		if (mode === "pokeca_summary") {
 			const commit = reqUrl.searchParams.get("commit") === "1";
 			const rank = reqUrl.searchParams.get("rank");
+			const templateImageUrl = reqUrl.searchParams.get("template_image_url");
 			const imagesParam = reqUrl.searchParams.get("images");
 			const imageLimit =
 				imagesParam == null
@@ -399,6 +586,7 @@ export default {
 				commit,
 				rank,
 				imageLimit,
+				templateImageUrl,
 				logToConsole: true,
 				fromSchedule: false,
 			});
@@ -406,6 +594,7 @@ export default {
 		}
 		if (mode === "pokeca_summary_preview") {
 			const rank = reqUrl.searchParams.get("rank");
+			const templateImageUrl = reqUrl.searchParams.get("template_image_url");
 			const imagesParam = reqUrl.searchParams.get("images");
 			const imageLimit =
 				imagesParam == null
@@ -415,6 +604,7 @@ export default {
 				commit: false,
 				rank,
 				imageLimit,
+				templateImageUrl,
 				logToConsole: true,
 				fromSchedule: false,
 				preferStoredSnapshot: true,
@@ -434,6 +624,34 @@ export default {
 			}
 		if (mode === "pokeca_summary_debug") {
 			const result = await runPokecaSummaryDebug();
+			return jsonResponse(result);
+		}
+		if (mode === "x_whoami") {
+			const result = await getXAuthenticatedAccount(env);
+			return jsonResponse(result);
+		}
+		if (mode === "x_auto_like_preview") {
+			const maxLikesRaw = reqUrl.searchParams.get("max_likes");
+			const maxLikesPerRun =
+				maxLikesRaw == null ? null : Math.max(0, Math.min(10, Math.trunc(Number(maxLikesRaw))));
+			const result = await runXAutoLike(env, {
+				commit: false,
+				logToConsole: true,
+				fromSchedule: false,
+				maxLikesPerRun,
+			});
+			return jsonResponse(result);
+		}
+		if (mode === "x_auto_like") {
+			const maxLikesRaw = reqUrl.searchParams.get("max_likes");
+			const maxLikesPerRun =
+				maxLikesRaw == null ? null : Math.max(0, Math.min(10, Math.trunc(Number(maxLikesRaw))));
+			const result = await runXAutoLike(env, {
+				commit: reqUrl.searchParams.get("commit") === "1",
+				logToConsole: true,
+				fromSchedule: false,
+				maxLikesPerRun,
+			});
 			return jsonResponse(result);
 		}
 
@@ -479,6 +697,13 @@ export default {
 				fromSchedule: true,
 			});
 		}
+		await runStreamScheduleDailyDigest(env, {
+			commit: true,
+			logToConsole: true,
+			fromSchedule: true,
+			respectPostWindow: true,
+			now: new Date(event.scheduledTime),
+		});
 		if (event.cron === "0 11 * * *") {
 			await refreshWatchlistPrices(env, { logToConsole: true });
 		}
@@ -497,6 +722,13 @@ export default {
 			});
 		} else if (isPokecaSummaryPostCron(event) && ENABLE_MARKET_SUMMARY_DAILY) {
 			await runMarketSummary(env, {
+				commit: true,
+				logToConsole: true,
+				fromSchedule: true,
+			});
+		}
+		if (isThirtyMinuteTick) {
+			await runXAutoLike(env, {
 				commit: true,
 				logToConsole: true,
 				fromSchedule: true,
@@ -801,187 +1033,6 @@ async function runDailyRandomSpotlight(
 	return result;
 }
 
-async function runPriceSpikeMode(
-	request: Request,
-	env: MonitorEnv,
-	options: { commit?: boolean; logToConsole?: boolean } = {},
-): Promise<Record<string, unknown>> {
-	const { commit = false, logToConsole = true } = options;
-	try {
-		const payload = (await request.json()) as PriceSpikePayload;
-		const spikes = Array.isArray(payload?.spikes) ? payload.spikes : [];
-		const rawSpike = spikes[0];
-		const spike = await enrichPriceSpikeIdentity(rawSpike, payload?.source);
-		const stateStore = createStateStore(env);
-		if (!spike || !spike.card) {
-			await appendPriceSpikeAudit(stateStore, {
-				at: new Date().toISOString(),
-				source: normalizePriceSpikeSource(payload?.source) ?? null,
-				card: null,
-				commit,
-				ok: false,
-				skipped: false,
-				postedToX: false,
-				reason: "invalid_payload",
-				xStatus: null,
-			});
-			return { ok: false, error: "invalid_payload", committed: false, postedToX: false, previewMessage: "" };
-		}
-		const inputValidation = validatePriceSpikeInput(spike, payload?.source);
-		if (!inputValidation.ok) {
-			await appendPriceSpikeAudit(stateStore, {
-				at: new Date().toISOString(),
-				source: normalizePriceSpikeSource(spike.source_site ?? payload?.source) ?? null,
-				card: getCanonicalPriceSpikeCardName(spike) || null,
-				commit,
-				ok: false,
-				skipped: false,
-				postedToX: false,
-				reason: inputValidation.reason ?? "validation_failed",
-				xStatus: null,
-			});
-			return {
-				ok: false,
-				error: inputValidation.reason,
-				committed: false,
-				postedToX: false,
-				previewMessage: "",
-			};
-		}
-		const watchlist = await upsertWatchlistFromSpike(stateStore, spike, payload?.source);
-		await stateStore.put(
-			LATEST_MARKET_CONTEXT_KEY,
-			JSON.stringify({
-				card: getCanonicalPriceSpikeCardName(spike),
-				cardId: String(spike.card_id ?? "").trim() || null,
-				beforePrice: Number(spike.before),
-				afterPrice: Number(spike.after),
-				changePct: Number(spike.change_pct),
-				sourceSite: normalizePriceSpikeSource(spike.source_site ?? payload?.source),
-				sourceUrl: spike.source_url ?? null,
-				fetchedAt: spike.fetched_at ?? new Date().toISOString(),
-				recordedAt: new Date().toISOString(),
-			}),
-		);
-		const key = `price_spike:${buildPriceSpikeIdentityKey(spike)}`;
-		const already = await stateStore.get(key);
-		if (already) {
-			await appendPriceSpikeAudit(stateStore, {
-				at: new Date().toISOString(),
-				source: normalizePriceSpikeSource(spike.source_site ?? payload?.source) ?? null,
-				card: getCanonicalPriceSpikeCardName(spike) || null,
-				commit,
-				ok: true,
-				skipped: true,
-				postedToX: false,
-				reason: "duplicate_skipped",
-				xStatus: null,
-			});
-			return {
-				ok: true,
-				skipped: true,
-				committed: false,
-				postedToX: false,
-				previewMessage: "",
-			};
-		}
-
-		const usePriceSpikeAi = isPriceSpikeAiEnabled(env);
-		let aiUsed = false;
-		let aiReason: string | null = null;
-		let previewMessage = buildPriceSpikeFallbackMessage(spike);
-		if (usePriceSpikeAi) {
-			const aiResult = await generatePriceSpikeMessage(spike, env);
-			if (aiResult.ok && aiResult.message) {
-				previewMessage = aiResult.message;
-				aiUsed = true;
-			} else {
-				aiReason = aiResult.reason ?? "price_spike_ai_failed";
-			}
-		} else {
-			aiReason = "price_spike_ai_disabled";
-		}
-
-		let postedToX = false;
-		let committed = false;
-		let xResponse: unknown = null;
-		if (commit) {
-			const source = normalizePriceSpikeSource(spike.source_site ?? payload?.source);
-			const canAttachImage = source === "pokeca-chart";
-			const postResult = await postTweetWithImages(
-				previewMessage,
-				{
-					mainImageUrl: canAttachImage ? spike.image_url ?? spike.imageUrl ?? null : null,
-					lastOneImageUrl: null,
-				},
-				env,
-				{
-					mainImageAlt: canAttachImage ? buildPriceSpikeImageAlt(spike) : null,
-				},
-			);
-			postedToX = postResult.ok;
-			xResponse = postResult;
-			if (postResult.ok) {
-				if (env.STATE) {
-					await env.STATE.put(key, "1", { expirationTtl: 21600 });
-				} else {
-					await stateStore.put(key, "1");
-				}
-				committed = true;
-			}
-		}
-
-		const result = {
-			ok: true,
-			committed,
-			postedToX,
-			previewMessage,
-			skipped: false,
-			aiUsed,
-			aiReason,
-			watchlistCount: watchlist.length,
-			xResponse,
-		};
-		await appendPriceSpikeAudit(stateStore, {
-			at: new Date().toISOString(),
-			source: normalizePriceSpikeSource(spike.source_site ?? payload?.source) ?? null,
-			card: getCanonicalPriceSpikeCardName(spike) || null,
-			commit,
-			ok: true,
-			skipped: false,
-			postedToX,
-			reason: postedToX || !commit ? null : "x_post_failed",
-			xStatus:
-				typeof (xResponse as { status?: unknown } | null)?.status === "number"
-					? Number((xResponse as { status?: unknown }).status)
-					: null,
-		});
-		if (logToConsole) console.log(JSON.stringify({ type: "PRICE_SPIKE_RESULT", ...result }, null, 2));
-		return result;
-	} catch (error) {
-		console.error("[price_spike] failed", error);
-		const stateStore = createStateStore(env);
-		await appendPriceSpikeAudit(stateStore, {
-			at: new Date().toISOString(),
-			source: null,
-			card: null,
-			commit,
-			ok: false,
-			skipped: false,
-			postedToX: false,
-			reason: error instanceof Error ? error.message : String(error),
-			xStatus: null,
-		});
-		return {
-			ok: false,
-			error: error instanceof Error ? error.message : String(error),
-			committed: false,
-			postedToX: false,
-			previewMessage: "",
-		};
-	}
-}
-
 async function runMarketSummary(
 	env: MonitorEnv,
 	options: { commit?: boolean; logToConsole?: boolean; fromSchedule?: boolean } = {},
@@ -1077,6 +1128,910 @@ async function runMarketSummary(
 	return result;
 }
 
+async function runStreamScheduleDailyDigest(
+	env: MonitorEnv,
+	options: StreamScheduleOptions = {},
+): Promise<Record<string, unknown>> {
+	const {
+		commit = false,
+		logToConsole = true,
+		fromSchedule = false,
+		targetDate = null,
+		daysAhead = null,
+		respectPostWindow = false,
+		force = false,
+		now = new Date(),
+	} = options;
+	const csvUrl = resolveStreamScheduleCsvUrl(env);
+	if (!csvUrl) {
+		const result = {
+			ok: false,
+			reason: "missing_stream_schedule_csv_url",
+			fromSchedule,
+			commitMode: commit,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "STREAM_SCHEDULE_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const targetDateKey = targetDate
+		? normalizeStreamScheduleTargetDate(targetDate)
+		: getStreamScheduleTargetDateKey(now, resolveStreamScheduleLookaheadDays(env, daysAhead));
+	if (!targetDateKey) {
+		const result = {
+			ok: false,
+			reason: "invalid_stream_schedule_target_date",
+			fromSchedule,
+			commitMode: commit,
+			targetDate,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "STREAM_SCHEDULE_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const csvResponse = await fetchStreamScheduleCsv(csvUrl);
+	if (!csvResponse.ok || !csvResponse.csv) {
+		const result = {
+			ok: false,
+			reason: "stream_schedule_csv_fetch_failed",
+			fromSchedule,
+			commitMode: commit,
+			targetDate: targetDateKey,
+			csvUrl,
+			status: csvResponse.status,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "STREAM_SCHEDULE_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const parsed = parseStreamScheduleCsv(csvResponse.csv, now);
+	if (!parsed.ok) {
+		const result = {
+			ok: false,
+			reason: "stream_schedule_csv_invalid",
+			fromSchedule,
+			commitMode: commit,
+			targetDate: targetDateKey,
+			csvUrl,
+			headers: parsed.headers,
+			missingHeaders: parsed.missingHeaders,
+			skippedRows: parsed.skippedRows,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "STREAM_SCHEDULE_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const entries = parsed.entries.filter((entry) => entry.dateKey === targetDateKey);
+	if (entries.length === 0) {
+		const result = {
+			ok: false,
+			reason: "stream_schedule_empty_target_date",
+			fromSchedule,
+			commitMode: commit,
+			targetDate: targetDateKey,
+			csvUrl,
+			totalEntries: parsed.entries.length,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "STREAM_SCHEDULE_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const postHourJst = resolveStreamSchedulePostHourJst(env);
+	const postAt = buildStreamSchedulePostAt(targetDateKey, postHourJst);
+	const dueToPost = !respectPostWindow || force || now.getTime() >= postAt.getTime();
+	const stateStore = createStateStore(env);
+	const postStateKey = `${STREAM_SCHEDULE_POSTED_PREFIX}${targetDateKey}`;
+	const alreadyPosted = !force && Boolean(await stateStore.get(postStateKey));
+	const preview = buildStreamScheduleMessage(targetDateKey, entries, {
+		headerLabel: resolveStreamScheduleHeaderLabel(env),
+		footer: resolveStreamScheduleFooter(env),
+		hashtags: resolveStreamScheduleHashtags(env),
+		linkUrl: resolveStreamScheduleLinkUrl(env),
+	});
+
+	let postedToX = false;
+	let committed = false;
+	let skipped = false;
+	let skipReason: string | null = null;
+	let xResponse: unknown = null;
+	if (commit) {
+		if (alreadyPosted) {
+			skipped = true;
+			skipReason = "already_posted";
+		} else if (!dueToPost) {
+			skipped = true;
+			skipReason = "not_due_yet";
+		} else {
+			const imageUrl = resolveStreamScheduleImageUrl(entries, env);
+			const postResult = await postTweetWithImages(
+				preview.message,
+				{
+					mainImageUrl: imageUrl,
+					lastOneImageUrl: null,
+				},
+				env,
+				{
+					mainImageAlt: imageUrl ? buildStreamScheduleImageAlt(targetDateKey, entries) : null,
+				},
+			);
+			postedToX = postResult.ok;
+			xResponse = postResult;
+			if (postResult.ok) {
+				await stateStore.put(
+					postStateKey,
+					JSON.stringify({
+						postedAt: now.toISOString(),
+						postAt: postAt.toISOString(),
+						entryCount: entries.length,
+						csvUrl,
+					}),
+				);
+				committed = true;
+			} else {
+				skipped = true;
+				skipReason = "x_post_failed";
+			}
+		}
+	}
+
+	const result = {
+		ok: true,
+		fromSchedule,
+		commitMode: commit,
+		committed,
+		postedToX,
+		skipped,
+		skipReason,
+		alreadyPosted,
+		dueToPost,
+		targetDate: targetDateKey,
+		targetDateLabel: getStreamScheduleDateLabel(targetDateKey),
+		daysAhead:
+			targetDate == null ? resolveStreamScheduleLookaheadDays(env, daysAhead) : null,
+		postHourJst,
+		postAt: postAt.toISOString(),
+		csvUrl,
+		entryCount: entries.length,
+		displayedCount: preview.displayedCount,
+		hiddenCount: preview.hiddenCount,
+		includedNotes: preview.includedNotes,
+		appendedUrl: preview.appendedUrl,
+		weightedLength: preview.weightedLength,
+		imageUrl: resolveStreamScheduleImageUrl(entries, env),
+		headers: parsed.headers,
+		skippedRows: parsed.skippedRows,
+		entries: entries.map((entry) => ({
+			rowNumber: entry.rowNumber,
+			timeLabel: entry.timeLabel,
+			title: entry.title,
+			note: entry.note,
+			url: entry.url,
+			imageUrl: entry.imageUrl,
+			startAt: entry.startAt,
+		})),
+		previewMessage: preview.message,
+		xResponse,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "STREAM_SCHEDULE_RESULT", ...result }, null, 2));
+	return result;
+}
+
+async function fetchStreamScheduleCsv(
+	csvUrl: string,
+): Promise<{ ok: boolean; status: number; csv?: string | null }> {
+	try {
+		const response = await fetch(csvUrl, {
+			headers: {
+				accept: "text/csv,text/plain;q=0.9,*/*;q=0.1",
+			},
+		});
+		const csv = await response.text();
+		return {
+			ok: response.ok,
+			status: response.status,
+			csv: response.ok ? csv : null,
+		};
+	} catch {
+		return {
+			ok: false,
+			status: 0,
+			csv: null,
+		};
+	}
+}
+
+function parseStreamScheduleCsv(csv: string, now = new Date()): StreamScheduleParseResult {
+	const records = parseCsvRecords(csv);
+	if (records.length === 0) {
+		return {
+			ok: false,
+			headers: [],
+			entries: [],
+			missingHeaders: ["title", "date"],
+			skippedRows: [],
+		};
+	}
+
+	const headers = records[0].map((value, index) => normalizeWhitespace(index === 0 ? stripBom(value) : value));
+	const titleIndex = findStreamScheduleHeaderIndex(headers, ["title", "streamtitle", "配信タイトル", "タイトル", "内容"]);
+	const datetimeIndex = findStreamScheduleHeaderIndex(headers, [
+		"datetime",
+		"startat",
+		"scheduledat",
+		"配信日時",
+		"開始日時",
+	]);
+	const dateIndex = findStreamScheduleHeaderIndex(headers, ["date", "scheduleddate", "streamdate", "日付", "配信日"]);
+	const timeIndex = findStreamScheduleHeaderIndex(headers, ["time", "starttime", "配信時間", "時間", "開始時間"]);
+	const noteIndex = findStreamScheduleHeaderIndex(headers, [
+		"note",
+		"memo",
+		"description",
+		"details",
+		"メモ",
+		"備考",
+		"説明",
+	]);
+	const urlIndex = findStreamScheduleHeaderIndex(headers, ["url", "streamurl", "link", "配信url", "配信リンク", "リンク"]);
+	const imageUrlIndex = findStreamScheduleHeaderIndex(headers, [
+		"imageurl",
+		"image",
+		"thumbnail",
+		"thumb",
+		"画像url",
+		"画像",
+		"サムネイル",
+	]);
+	const missingHeaders: string[] = [];
+	if (titleIndex < 0) missingHeaders.push("title");
+	if (datetimeIndex < 0 && dateIndex < 0) missingHeaders.push("date");
+
+	const entries: StreamScheduleEntry[] = [];
+	const skippedRows: Array<{ rowNumber: number; reason: string }> = [];
+	if (missingHeaders.length > 0) {
+		const matrixResult = parseStreamScheduleMatrix(records, now);
+		if (matrixResult.ok) return matrixResult;
+		return {
+			ok: false,
+			headers,
+			entries,
+			missingHeaders: [...missingHeaders, ...matrixResult.missingHeaders],
+			skippedRows: matrixResult.skippedRows,
+		};
+	}
+
+	for (let index = 1; index < records.length; index += 1) {
+		const row = records[index];
+		const rowNumber = index + 1;
+		const title = normalizeWhitespace(row[titleIndex] ?? "");
+		if (!title) continue;
+		const dateText = normalizeWhitespace(
+			datetimeIndex >= 0 ? row[datetimeIndex] ?? "" : row[dateIndex] ?? "",
+		);
+		const timeText = normalizeWhitespace(timeIndex >= 0 ? row[timeIndex] ?? "" : "");
+		const parsedDateTime = parseStreamScheduleDateTime(dateText, timeText, now);
+		if (!parsedDateTime.startAt) {
+			skippedRows.push({ rowNumber, reason: "invalid_date_time" });
+			continue;
+		}
+		const note = normalizeOptionalStreamScheduleField(noteIndex >= 0 ? row[noteIndex] ?? "" : "");
+		const url = normalizeOptionalUrl(urlIndex >= 0 ? row[urlIndex] ?? "" : "");
+		const imageUrl = normalizeOptionalUrl(imageUrlIndex >= 0 ? row[imageUrlIndex] ?? "" : "");
+		entries.push({
+			rowNumber,
+			dateKey: getJstYmd(new Date(parsedDateTime.startAt)),
+			startAt: parsedDateTime.startAt,
+			sortTimeValue: parsedDateTime.sortTimeValue,
+			timeLabel: parsedDateTime.timeLabel,
+			title,
+			note,
+			url,
+			imageUrl,
+		});
+	}
+
+	entries.sort((a, b) => {
+		if (a.dateKey !== b.dateKey) return a.dateKey.localeCompare(b.dateKey);
+		const aTime = a.sortTimeValue ?? Number.MAX_SAFE_INTEGER;
+		const bTime = b.sortTimeValue ?? Number.MAX_SAFE_INTEGER;
+		if (aTime !== bTime) return aTime - bTime;
+		return a.rowNumber - b.rowNumber;
+	});
+
+	return {
+		ok: true,
+		headers,
+		entries,
+		missingHeaders: [],
+		skippedRows,
+	};
+}
+
+function parseStreamScheduleMatrix(records: string[][], now = new Date()): StreamScheduleParseResult {
+	const headerRowIndex = findStreamScheduleMatrixHeaderRowIndex(records);
+	if (headerRowIndex < 0) {
+		return {
+			ok: false,
+			headers: records[0] ?? [],
+			entries: [],
+			missingHeaders: ["matrix_date_header"],
+			skippedRows: [],
+		};
+	}
+	const dateColumns = buildStreamScheduleMatrixDateColumns(records[headerRowIndex] ?? [], now);
+	if (dateColumns.length === 0) {
+		return {
+			ok: false,
+			headers: records[headerRowIndex] ?? [],
+			entries: [],
+			missingHeaders: ["matrix_date_columns"],
+			skippedRows: [],
+		};
+	}
+	const streamRows = extractStreamScheduleMatrixRows(records, headerRowIndex);
+	if (streamRows.length === 0) {
+		return {
+			ok: false,
+			headers: records[headerRowIndex] ?? [],
+			entries: [],
+			missingHeaders: ["matrix_stream_rows"],
+			skippedRows: [],
+		};
+	}
+
+	const entries: StreamScheduleEntry[] = [];
+	const skippedRows: Array<{ rowNumber: number; reason: string }> = [];
+	for (const streamRow of streamRows) {
+		for (const dateColumn of dateColumns) {
+			const rawCell = normalizeWhitespace(streamRow.cells[dateColumn.columnIndex] ?? "");
+			if (!rawCell) continue;
+			const timeParts = extractStreamScheduleTimeParts(rawCell);
+			const utcMs = Date.UTC(
+				dateColumn.year,
+				dateColumn.month - 1,
+				dateColumn.day,
+				(timeParts?.hour ?? 0) - 9,
+				timeParts?.minute ?? 0,
+				0,
+			);
+			const startAt = new Date(utcMs);
+			if (!Number.isFinite(startAt.getTime())) {
+				skippedRows.push({ rowNumber: streamRow.rowNumber, reason: "invalid_matrix_datetime" });
+				continue;
+			}
+			const note = normalizeOptionalStreamScheduleField(rawCell);
+			entries.push({
+				rowNumber: streamRow.rowNumber,
+				dateKey: dateColumn.dateKey,
+				startAt: startAt.toISOString(),
+				sortTimeValue: timeParts ? timeParts.hour * 60 + timeParts.minute : null,
+				timeLabel: timeParts
+					? `${String(timeParts.hour).padStart(2, "0")}:${String(timeParts.minute).padStart(2, "0")}`
+					: "時間未定",
+				title: `${streamRow.location}配信`,
+				note,
+				url: null,
+				imageUrl: null,
+			});
+		}
+	}
+
+	entries.sort((a, b) => {
+		if (a.dateKey !== b.dateKey) return a.dateKey.localeCompare(b.dateKey);
+		const aTime = a.sortTimeValue ?? Number.MAX_SAFE_INTEGER;
+		const bTime = b.sortTimeValue ?? Number.MAX_SAFE_INTEGER;
+		if (aTime !== bTime) return aTime - bTime;
+		return a.rowNumber - b.rowNumber;
+	});
+
+	return {
+		ok: entries.length > 0,
+		headers: records[headerRowIndex] ?? [],
+		entries,
+		missingHeaders: entries.length > 0 ? [] : ["matrix_entries_empty"],
+		skippedRows,
+	};
+}
+
+function findStreamScheduleMatrixHeaderRowIndex(records: string[][]): number {
+	for (let rowIndex = 0; rowIndex < Math.min(records.length, 15); rowIndex += 1) {
+		const row = records[rowIndex] ?? [];
+		const dateLikeCount = row.reduce((count, cell) => (isMonthDayCell(cell) ? count + 1 : count), 0);
+		const joinedHeader = row.map((cell) => normalizeWhitespace(cell)).join(",");
+		const hasStreamerHeader = /配信者|streamer/i.test(joinedHeader);
+		if (dateLikeCount >= 10) return rowIndex;
+		if (dateLikeCount >= 2 && hasStreamerHeader) return rowIndex;
+	}
+	return -1;
+}
+
+function isMonthDayCell(value: string): boolean {
+	return /^(\d{1,2})\/(\d{1,2})$/.test(normalizeWhitespace(value));
+}
+
+function buildStreamScheduleMatrixDateColumns(
+	headerRow: string[],
+	now = new Date(),
+): Array<{ columnIndex: number; year: number; month: number; day: number; dateKey: string }> {
+	const columns: Array<{ columnIndex: number; month: number; day: number }> = [];
+	for (let columnIndex = 0; columnIndex < headerRow.length; columnIndex += 1) {
+		const cell = normalizeWhitespace(headerRow[columnIndex] ?? "");
+		const match = cell.match(/^(\d{1,2})\/(\d{1,2})$/);
+		if (!match) continue;
+		const month = Number(match[1]);
+		const day = Number(match[2]);
+		if (!Number.isFinite(month) || !Number.isFinite(day)) continue;
+		if (month < 1 || month > 12 || day < 1 || day > 31) continue;
+		columns.push({ columnIndex, month, day });
+	}
+	if (columns.length === 0) return [];
+
+	const currentYear = getJstNow(now).getUTCFullYear();
+	const currentMonth = getJstNow(now).getUTCMonth() + 1;
+	let year = columns[0].month > currentMonth + 2 ? currentYear - 1 : currentYear;
+	let previousMonth = columns[0].month;
+
+	return columns.map((column, index) => {
+		if (index > 0 && column.month < previousMonth) year += 1;
+		previousMonth = column.month;
+		const dateKey = `${year}-${String(column.month).padStart(2, "0")}-${String(column.day).padStart(2, "0")}`;
+		return {
+			columnIndex: column.columnIndex,
+			year,
+			month: column.month,
+			day: column.day,
+			dateKey,
+		};
+	});
+}
+
+function extractStreamScheduleMatrixRows(
+	records: string[][],
+	headerRowIndex: number,
+): Array<{ rowNumber: number; location: string; cells: string[] }> {
+	const rows: Array<{ rowNumber: number; location: string; cells: string[] }> = [];
+	let inStreamSection = false;
+	for (let rowIndex = headerRowIndex + 1; rowIndex < records.length; rowIndex += 1) {
+		const row = records[rowIndex] ?? [];
+		const col2 = normalizeWhitespace(row[1] ?? "");
+		const col3 = normalizeWhitespace(row[2] ?? "");
+		if (/配信時刻予定/.test(col2)) {
+			inStreamSection = true;
+			if (col3) {
+				rows.push({ rowNumber: rowIndex + 1, location: col3, cells: row });
+			}
+			continue;
+		}
+		if (!inStreamSection) continue;
+		if (/稼働人数/.test(col3)) break;
+		if (col2 && !/配信時刻予定/.test(col2)) break;
+		if (!col3) continue;
+		if (isMonthDayCell(col3)) continue;
+		rows.push({ rowNumber: rowIndex + 1, location: col3, cells: row });
+	}
+	return rows;
+}
+
+function parseCsvRecords(csv: string): string[][] {
+	const rows: string[][] = [];
+	let row: string[] = [];
+	let cell = "";
+	let inQuotes = false;
+	for (let index = 0; index < csv.length; index += 1) {
+		const ch = csv[index];
+		if (inQuotes) {
+			if (ch === '"') {
+				if (csv[index + 1] === '"') {
+					cell += '"';
+					index += 1;
+				} else {
+					inQuotes = false;
+				}
+			} else {
+				cell += ch;
+			}
+			continue;
+		}
+		if (ch === '"') {
+			inQuotes = true;
+			continue;
+		}
+		if (ch === ",") {
+			row.push(cell);
+			cell = "";
+			continue;
+		}
+		if (ch === "\n") {
+			row.push(cell);
+			rows.push(row);
+			row = [];
+			cell = "";
+			continue;
+		}
+		if (ch === "\r") {
+			if (csv[index + 1] === "\n") index += 1;
+			row.push(cell);
+			rows.push(row);
+			row = [];
+			cell = "";
+			continue;
+		}
+		cell += ch;
+	}
+	if (cell.length > 0 || row.length > 0) {
+		row.push(cell);
+		rows.push(row);
+	}
+	return rows.filter((item, index) => index === 0 || item.some((cellValue) => String(cellValue).trim() !== ""));
+}
+
+function findStreamScheduleHeaderIndex(headers: string[], aliases: string[]): number {
+	const normalizedAliases = new Set(aliases.map((alias) => normalizeStreamScheduleHeader(alias)));
+	return headers.findIndex((header) => normalizedAliases.has(normalizeStreamScheduleHeader(header)));
+}
+
+function normalizeStreamScheduleHeader(value: string): string {
+	return String(value ?? "")
+		.trim()
+		.toLowerCase()
+		.replace(/[\s_\-()（）/\\:：]+/g, "");
+}
+
+function parseStreamScheduleDateTime(
+	dateText: string,
+	timeText: string,
+	now = new Date(),
+): { startAt: string | null; sortTimeValue: number | null; timeLabel: string } {
+	const explicit = parseExplicitTimestamp(dateText);
+	if (explicit) {
+		const jst = getJstNow(explicit);
+		const hour = jst.getUTCHours();
+		const minute = jst.getUTCMinutes();
+		return {
+			startAt: explicit.toISOString(),
+			sortTimeValue: hour * 60 + minute,
+			timeLabel: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+		};
+	}
+
+	const dateParts = parseStreamScheduleDateParts(dateText, now);
+	if (!dateParts) {
+		return { startAt: null, sortTimeValue: null, timeLabel: "時間未定" };
+	}
+	const timeParts = extractStreamScheduleTimeParts(timeText) ?? extractStreamScheduleTimeParts(dateText);
+	const utcMs = Date.UTC(
+		dateParts.year,
+		dateParts.month - 1,
+		dateParts.day,
+		(timeParts?.hour ?? 0) - 9,
+		timeParts?.minute ?? 0,
+		0,
+	);
+	return {
+		startAt: new Date(utcMs).toISOString(),
+		sortTimeValue: timeParts ? timeParts.hour * 60 + timeParts.minute : null,
+		timeLabel: timeParts
+			? `${String(timeParts.hour).padStart(2, "0")}:${String(timeParts.minute).padStart(2, "0")}`
+			: "時間未定",
+	};
+}
+
+function parseExplicitTimestamp(value: string): Date | null {
+	const text = String(value ?? "").trim();
+	if (!text || !/[tT ]/.test(text)) return null;
+	if (!/(?:[zZ]|[+\-]\d{2}:?\d{2})$/.test(text)) return null;
+	const parsed = new Date(text);
+	return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function parseStreamScheduleDateParts(
+	value: string,
+	now = new Date(),
+): { year: number; month: number; day: number } | null {
+	const source = String(value ?? "")
+		.replace(/\(.+?\)/g, " ")
+		.replace(/（.+?）/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!source) return null;
+	const full = source.match(/(\d{4})[\/\-\.年]\s*(\d{1,2})[\/\-\.月]\s*(\d{1,2})/);
+	if (full) {
+		return {
+			year: Number(full[1]),
+			month: Number(full[2]),
+			day: Number(full[3]),
+		};
+	}
+	const partial = source.match(/(\d{1,2})[\/\-\.月]\s*(\d{1,2})/);
+	if (partial) {
+		const currentYear = getJstNow(now).getUTCFullYear();
+		return {
+			year: currentYear,
+			month: Number(partial[1]),
+			day: Number(partial[2]),
+		};
+	}
+	return null;
+}
+
+function extractStreamScheduleTimeParts(value: string): { hour: number; minute: number } | null {
+	const source = String(value ?? "").trim();
+	const hhmm = source.match(/(\d{1,2}):(\d{2})/);
+	if (hhmm) {
+		return {
+			hour: Number(hhmm[1]),
+			minute: Number(hhmm[2]),
+		};
+	}
+	const jp = source.match(/(\d{1,2})時(?:\s*(\d{1,2})分?)?/);
+	if (jp) {
+		return {
+			hour: Number(jp[1]),
+			minute: Number(jp[2] ?? 0),
+		};
+	}
+	return null;
+}
+
+function buildStreamScheduleMessage(
+	targetDateKey: string,
+	entries: StreamScheduleEntry[],
+	options: {
+		headerLabel?: string | null;
+		footer?: string | null;
+		hashtags?: string[];
+		linkUrl?: string | null;
+	} = {},
+): {
+	message: string;
+	weightedLength: number;
+	displayedCount: number;
+	hiddenCount: number;
+	includedNotes: boolean;
+	appendedUrl: string | null;
+} {
+	const headerLabel = normalizeWhitespace(options.headerLabel ?? "") || "配信予定";
+	const header = `【${getStreamScheduleDateLabel(targetDateKey)} ${headerLabel}】`;
+	const footer = normalizeOptionalStreamScheduleField(options.footer ?? "");
+	const hashtags = Array.isArray(options.hashtags) ? options.hashtags.filter(Boolean) : [];
+	const linkUrl = resolveStreamScheduleMessageLink(entries, options.linkUrl ?? null);
+	const noteModes = entries.some((entry) => entry.note) ? [true, false] : [false];
+	const footerOptions = footer ? [footer, null] : [null];
+	const linkOptions = linkUrl ? [linkUrl, null] : [null];
+
+	for (const includeNotes of noteModes) {
+		for (let visibleCount = entries.length; visibleCount >= 1; visibleCount -= 1) {
+			const hiddenCount = entries.length - visibleCount;
+			const bodyLines = buildStreamScheduleBodyLines(entries.slice(0, visibleCount), includeNotes, hiddenCount);
+			for (const footerValue of footerOptions) {
+				for (const linkValue of linkOptions) {
+					const message = assembleStreamScheduleMessage(header, bodyLines, footerValue, linkValue, hashtags);
+					const weightedLength = countXWeightedLength(message);
+					if (weightedLength <= POKECA_TWEET_TEXT_LIMIT) {
+						return {
+							message,
+							weightedLength,
+							displayedCount: visibleCount,
+							hiddenCount,
+							includedNotes: includeNotes,
+							appendedUrl: linkValue,
+						};
+					}
+				}
+			}
+		}
+	}
+
+	const first = entries[0];
+	const fallbackLine = buildStreamScheduleEntryLine(first, false, true);
+	const fallbackMessage = assembleStreamScheduleMessage(header, [fallbackLine], null, null, hashtags);
+	return {
+		message: fallbackMessage,
+		weightedLength: countXWeightedLength(fallbackMessage),
+		displayedCount: 1,
+		hiddenCount: Math.max(0, entries.length - 1),
+		includedNotes: false,
+		appendedUrl: null,
+	};
+}
+
+function buildStreamScheduleBodyLines(
+	entries: StreamScheduleEntry[],
+	includeNotes: boolean,
+	hiddenCount: number,
+): string[] {
+	const lines = entries.map((entry) => buildStreamScheduleEntryLine(entry, includeNotes, false));
+	if (hiddenCount > 0) {
+		lines.push(`ほか${hiddenCount}枠`);
+	}
+	return lines;
+}
+
+function buildStreamScheduleEntryLine(
+	entry: StreamScheduleEntry,
+	includeNotes: boolean,
+	compact: boolean,
+): string {
+	const titleLimit = compact ? 26 : includeNotes ? 32 : 44;
+	const noteLimit = compact ? 12 : 18;
+	const title = compactStreamScheduleText(entry.title, titleLimit);
+	let line = `${entry.timeLabel} ${title}`.trim();
+	if (includeNotes && entry.note) {
+		line += `（${compactStreamScheduleText(entry.note, noteLimit)}）`;
+	}
+	return line;
+}
+
+function compactStreamScheduleText(value: string, maxLen: number): string {
+	const normalized = sanitizeStreamScheduleSnippet(value);
+	if (normalized.length <= maxLen) return normalized;
+	return `${normalized.slice(0, Math.max(1, maxLen - 1)).trimEnd()}…`;
+}
+
+function sanitizeStreamScheduleSnippet(value: string): string {
+	return String(value ?? "")
+		.replace(/https?:\/\/\S+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+function assembleStreamScheduleMessage(
+	header: string,
+	bodyLines: string[],
+	footer: string | null,
+	linkUrl: string | null,
+	hashtags: string[],
+): string {
+	const lines: string[] = [header, ...bodyLines];
+	if (footer) {
+		lines.push("", footer);
+	}
+	if (linkUrl) {
+		lines.push("", linkUrl);
+	}
+	if (hashtags.length > 0) {
+		lines.push("", hashtags.join(" "));
+	}
+	return lines.join("\n").trim();
+}
+
+function normalizeStreamScheduleTargetDate(value: string): string | null {
+	const trimmed = String(value ?? "").trim();
+	const match = trimmed.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+	if (!match) return null;
+	return `${match[1]}-${String(Number(match[2])).padStart(2, "0")}-${String(Number(match[3])).padStart(2, "0")}`;
+}
+
+function getStreamScheduleTargetDateKey(now = new Date(), daysAhead = 0): string {
+	const jst = getJstNow(now);
+	jst.setUTCDate(jst.getUTCDate() + daysAhead);
+	return `${jst.getUTCFullYear()}-${String(jst.getUTCMonth() + 1).padStart(2, "0")}-${String(
+		jst.getUTCDate(),
+	).padStart(2, "0")}`;
+}
+
+function buildStreamSchedulePostAt(targetDateKey: string, postHourJst: number): Date {
+	const match = targetDateKey.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+	if (!match) return new Date(0);
+	const utcMs = Date.UTC(
+		Number(match[1]),
+		Number(match[2]) - 1,
+		Number(match[3]),
+		postHourJst - 9,
+		0,
+		0,
+	);
+	return new Date(utcMs);
+}
+
+function getStreamScheduleDateLabel(targetDateKey: string): string {
+	const match = targetDateKey.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+	if (!match) return targetDateKey;
+	const utcMs = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), -9, 0, 0);
+	const jst = getJstNow(new Date(utcMs));
+	return `${jst.getUTCMonth() + 1}/${jst.getUTCDate()}(${JST_WEEKDAY_LABELS[jst.getUTCDay()]})`;
+}
+
+function resolveStreamSchedulePostHourJst(env: MonitorEnv): number {
+	const parsed = Number(env.STREAM_SCHEDULE_POST_HOUR_JST ?? STREAM_SCHEDULE_DEFAULT_POST_HOUR_JST);
+	if (!Number.isFinite(parsed)) return STREAM_SCHEDULE_DEFAULT_POST_HOUR_JST;
+	return Math.max(0, Math.min(23, Math.trunc(parsed)));
+}
+
+function resolveStreamScheduleCsvUrl(env: MonitorEnv): string {
+	const raw = String(env.STREAM_SCHEDULE_CSV_URL ?? "").trim();
+	if (!raw) return "";
+	const normalized = convertGoogleSheetEditUrlToCsv(raw);
+	return normalizeOptionalUrl(normalized) ?? "";
+}
+
+function convertGoogleSheetEditUrlToCsv(url: string): string {
+	const raw = String(url ?? "").trim();
+	const match = raw.match(/https:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)\/edit(?:\?([^#]*))?(?:#gid=(\d+))?/);
+	if (!match) return raw;
+	const spreadsheetId = match[1];
+	const query = new URLSearchParams(match[2] ?? "");
+	const gidFromQuery = query.get("gid");
+	const gidFromHash = match[3] ?? null;
+	const gid = gidFromQuery || gidFromHash || "0";
+	return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${encodeURIComponent(gid)}`;
+}
+
+function resolveStreamScheduleLookaheadDays(env: MonitorEnv, override: number | null): number {
+	const raw = override ?? Number(env.STREAM_SCHEDULE_LOOKAHEAD_DAYS ?? STREAM_SCHEDULE_DEFAULT_LOOKAHEAD_DAYS);
+	if (!Number.isFinite(raw)) return STREAM_SCHEDULE_DEFAULT_LOOKAHEAD_DAYS;
+	return Math.max(0, Math.min(7, Math.trunc(raw)));
+}
+
+function resolveStreamScheduleHeaderLabel(env: MonitorEnv): string | null {
+	return normalizeOptionalStreamScheduleField(env.STREAM_SCHEDULE_HEADER ?? "");
+}
+
+function resolveStreamScheduleFooter(env: MonitorEnv): string | null {
+	return normalizeOptionalStreamScheduleField(env.STREAM_SCHEDULE_FOOTER ?? "");
+}
+
+function resolveStreamScheduleHashtags(env: MonitorEnv): string[] {
+	const raw = String(env.STREAM_SCHEDULE_HASHTAGS ?? "配信予定").trim();
+	if (!raw) return [];
+	const tags = raw
+		.split(/[,\s]+/)
+		.map((tag) => tag.trim())
+		.filter(Boolean)
+		.map((tag) => (tag.startsWith("#") ? tag : `#${tag}`));
+	return [...new Set(tags)].slice(0, 2);
+}
+
+function resolveStreamScheduleLinkUrl(env: MonitorEnv): string | null {
+	return normalizeOptionalUrl(env.STREAM_SCHEDULE_LINK_URL ?? "");
+}
+
+function resolveStreamScheduleImageUrl(entries: StreamScheduleEntry[], env: MonitorEnv): string | null {
+	for (const entry of entries) {
+		if (entry.imageUrl) return entry.imageUrl;
+	}
+	return normalizeOptionalUrl(env.STREAM_SCHEDULE_IMAGE_URL ?? "");
+}
+
+function resolvePokecaSummaryTemplateImageUrl(env: MonitorEnv, overrideUrl: string | null): string | null {
+	const override = normalizeOptionalUrl(overrideUrl ?? "");
+	if (override) return override;
+	return normalizeOptionalUrl(env.POKECA_SUMMARY_TEMPLATE_IMAGE_URL ?? "");
+}
+
+function resolveStreamScheduleMessageLink(entries: StreamScheduleEntry[], fallbackUrl: string | null): string | null {
+	if (fallbackUrl) return fallbackUrl;
+	const uniqueUrls = [...new Set(entries.map((entry) => entry.url).filter((value): value is string => Boolean(value)))];
+	return uniqueUrls.length === 1 ? uniqueUrls[0] : null;
+}
+
+function buildStreamScheduleImageAlt(targetDateKey: string, entries: StreamScheduleEntry[]): string {
+	const parts = entries
+		.slice(0, 6)
+		.map((entry) => `${entry.timeLabel} ${sanitizeStreamScheduleSnippet(entry.title)}`)
+		.join("。");
+	return `${getStreamScheduleDateLabel(targetDateKey)}の配信予定。${parts}`.slice(0, 1000);
+}
+
+function normalizeOptionalStreamScheduleField(value: string): string | null {
+	const normalized = normalizeWhitespace(String(value ?? ""));
+	return normalized || null;
+}
+
+function normalizeOptionalUrl(value: string): string | null {
+	const normalized = String(value ?? "").trim();
+	if (!/^https?:\/\//i.test(normalized)) return null;
+	return normalized;
+}
+
+function normalizeWhitespace(value: string): string {
+	return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function stripBom(value: string): string {
+	return String(value ?? "").replace(/^\uFEFF/, "");
+}
+
 async function refreshWatchlistPrices(
 	env: MonitorEnv,
 	options: { logToConsole?: boolean } = {},
@@ -1136,6 +2091,15 @@ function getJstYmd(now = new Date()): string {
 	return `${y}-${m}-${d}`;
 }
 
+function getJstYmdShifted(now: Date, offsetDays: number): string {
+	const jst = getJstNow(now);
+	jst.setUTCDate(jst.getUTCDate() + Math.trunc(offsetDays));
+	const y = String(jst.getUTCFullYear());
+	const m = String(jst.getUTCMonth() + 1).padStart(2, "0");
+	const d = String(jst.getUTCDate()).padStart(2, "0");
+	return `${y}-${m}-${d}`;
+}
+
 function parsePokecaRankTarget(raw: string | null | undefined): PokecaRankTarget | null {
 	const value = String(raw ?? "").trim().toLowerCase();
 	if (value === "rank_rise_7" || value === "rise_7") return "rank_rise_7";
@@ -1153,6 +2117,8 @@ function getPokecaAutoThemeRankTarget(jstDate: Date): PokecaRankTarget {
 	switch (dow) {
 		case 0:
 			return "rank_vol";
+		case 1:
+			return "rank_fall_7";
 		case 2:
 		case 5:
 			return "rank_vol";
@@ -1167,7 +2133,7 @@ function getPokecaAutoThemeRankTarget(jstDate: Date): PokecaRankTarget {
 function resolvePokecaRankTarget(
 	rawRank: string | null | undefined,
 	jstDate: Date,
-): { rankTarget: PokecaRankTarget; rankSource: "param" | "auto_weekday" | "default" } {
+): { rankTarget: PokecaRankTarget; rankSource: "param" | "auto_weekday" | "default" | "ai_theme" } {
 	const parsed = parsePokecaRankTarget(rawRank);
 	if (parsed) {
 		return { rankTarget: parsed, rankSource: "param" };
@@ -1181,10 +2147,139 @@ function resolvePokecaRankTarget(
 	return { rankTarget: "rank_rise_7", rankSource: "default" };
 }
 
+async function getPokecaThemeHistory(stateStore: StateStore): Promise<PokecaRankTarget[]> {
+	const raw = await stateStore.get(POKECA_SUMMARY_THEME_HISTORY_KEY);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed
+			.map((v) => parsePokecaRankTarget(String(v ?? "")))
+			.filter((v): v is PokecaRankTarget => Boolean(v))
+			.slice(0, 14);
+	} catch {
+		return [];
+	}
+}
+
+async function appendPokecaThemeHistory(stateStore: StateStore, rankTarget: PokecaRankTarget): Promise<void> {
+	const current = await getPokecaThemeHistory(stateStore);
+	const next = [rankTarget, ...current].slice(0, 14);
+	await stateStore.put(POKECA_SUMMARY_THEME_HISTORY_KEY, JSON.stringify(next));
+}
+
+async function getPokecaOriginalThemeHistory(stateStore: StateStore): Promise<string[]> {
+	const raw = await stateStore.get(POKECA_SUMMARY_ORIGINAL_THEME_HISTORY_KEY);
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed
+			.map((v) => String(v ?? "").trim())
+			.filter(Boolean)
+			.slice(0, 14);
+	} catch {
+		return [];
+	}
+}
+
+async function appendPokecaOriginalThemeHistory(stateStore: StateStore, themeKey: string): Promise<void> {
+	const current = await getPokecaOriginalThemeHistory(stateStore);
+	const next = [String(themeKey ?? "").trim(), ...current].filter(Boolean).slice(0, 14);
+	await stateStore.put(POKECA_SUMMARY_ORIGINAL_THEME_HISTORY_KEY, JSON.stringify(next));
+}
+
+async function choosePokecaOriginalCandidateByAi(
+	env: MonitorEnv,
+	stateStore: StateStore,
+	now: Date,
+	candidates: PokecaOriginalCandidate[],
+): Promise<{ ok: boolean; key?: string; reason?: string; model?: string | null }> {
+	if (candidates.length === 0) return { ok: false, reason: "no_candidates", model: null };
+	if (!isPokecaSummaryAiEnabled(env)) return { ok: false, reason: "pokeca_summary_ai_disabled", model: null };
+	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key", model: null };
+	const model = resolvePokecaSummaryModel(env);
+	const history = await getPokecaOriginalThemeHistory(stateStore);
+	const historyLabel = history.length > 0 ? history.join(", ") : "none";
+	const dateLabel = formatJstDateLabel(now);
+	const candidateBlock = candidates
+		.map((c) => {
+			const sample = c.rows
+				.slice(0, 2)
+				.map((r) => `${stripPokecaCardVariant(r.cardName)} ${formatSignedNumber(r.deltaPrice, "円")} ${formatSignedPercent(r.deltaPct)}`)
+				.join(" / ");
+			return `- key=${c.key} label=${c.label} sample=${sample}`;
+		})
+		.join("\n");
+	const prompt = [
+		"自前スナップショット比較の投稿テーマを1つ選んでください。",
+		`日付: ${dateLabel}`,
+		`直近テーマ履歴(新しい順): ${historyLabel}`,
+		"",
+		"候補:",
+		candidateBlock,
+		"",
+		"ルール:",
+		"- 同じキーの連投は避ける",
+		"- 読者にとって変化が分かりやすいものを優先",
+		"- 出力は key のみ1語",
+	].join("\n");
+	const response = await callAnthropicTextGeneration({
+		system: "候補キーを1語で返すアシスタント。",
+		prompt,
+		apiKey: env.ANTHROPIC_API_KEY,
+		model,
+	});
+	if (!response.ok || !response.text) return { ok: false, reason: response.reason ?? "anthropic_failed", model };
+	const key = String(response.text).trim().split(/\s+/)[0] ?? "";
+	if (!candidates.some((c) => c.key === key)) return { ok: false, reason: "ai_candidate_parse_failed", model };
+	return { ok: true, key, model };
+}
+
+async function choosePokecaRankTargetByAi(
+	env: MonitorEnv,
+	stateStore: StateStore,
+	now: Date,
+): Promise<{ ok: boolean; rankTarget?: PokecaRankTarget; reason?: string; model?: string | null }> {
+	if (!isPokecaSummaryAiEnabled(env)) return { ok: false, reason: "pokeca_summary_ai_disabled", model: null };
+	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key", model: null };
+	const model = resolvePokecaSummaryModel(env);
+	const history = await getPokecaThemeHistory(stateStore);
+	const historyLabel = history.length > 0 ? history.join(", ") : "none";
+	const dateLabel = formatJstDateLabel(now);
+	const prompt = [
+		"あなたはポケカ投稿の編集者です。",
+		"今日の投稿テーマを1つ選んでください。",
+		"",
+		`日付: ${dateLabel}`,
+		`直近テーマ履歴(新しい順): ${historyLabel}`,
+		"",
+		"候補キー:",
+		"- rank_rise_7（7日変動の高騰）",
+		"- rank_fall_7（7日変動の下落）",
+		"- rank_vol（取引件数）",
+		"",
+		"ルール:",
+		"- 同じテーマの連投は避ける",
+		"- 直近7日で少ないテーマを優先",
+		"- 出力は候補キー1語のみ",
+	].join("\n");
+	const response = await callAnthropicTextGeneration({
+		system: "出力は指定キー1語のみ返すアシスタント。",
+		prompt,
+		apiKey: env.ANTHROPIC_API_KEY,
+		model,
+	});
+	if (!response.ok || !response.text) return { ok: false, reason: response.reason ?? "anthropic_failed", model };
+	const picked = parsePokecaRankTarget(String(response.text).trim().split(/\s+/)[0] ?? "");
+	if (!picked) return { ok: false, reason: "ai_theme_parse_failed", model };
+	return { ok: true, rankTarget: picked, model };
+}
+
 function getPokecaRankLabel(rank: PokecaRankTarget): string {
-	if (rank === "rank_fall_7") return "下落ランキング -フリマ-";
-	if (rank === "rank_vol") return "取引件数ランキング -フリマ-";
-	return "高騰ランキング -フリマ-";
+	if (rank === "rank_fall_7") return "下落ランキング";
+	if (rank === "rank_vol") return "取引件数ランキング";
+	return "高騰ランキング";
 }
 
 function getPokecaRankSortValue(item: PokecaApiItem, rank: PokecaRankTarget): number {
@@ -1294,32 +2389,638 @@ function buildPokecaSummaryLead(
 		const topCards = cards.slice(0, POKECA_POST_RANK_LIMIT);
 		const pikachuCount = topCards.filter((card) => /ピカチュウ/i.test(card.cardName)).length;
 		if (pikachuCount >= 3) {
-			return "観測メモ: ピカチュウ系が強め。";
+			return "ピカチュウ系が強め。";
 		}
-		return "観測メモ: 上振れ銘柄を追跡。";
+		return "上振れ銘柄を追跡。";
 	}
 	if (rankTarget === "rank_fall_7") {
-		return "観測メモ: 調整幅が大きい銘柄。";
+		return "調整幅が大きい銘柄。";
 	}
 	if (dow === 0) {
-		return "観測メモ: 日曜は取引集中銘柄。";
+		return "日曜は取引集中銘柄。";
 	}
-	return "観測メモ: 取引集中銘柄を確認。";
+	return "取引集中銘柄を確認。";
 }
 
-function getPokecaRankWindowLabel(rankTarget: PokecaRankTarget): string | null {
+function formatPokecaSummaryLeadLine(text: string): string {
+	const cleaned = String(text ?? "")
+		.trim()
+		.replace(/^ひとこと[:：]\s*/u, "")
+		.replace(/^[（(]+|[）)]+$/g, "")
+		.trim();
+	return `（${cleaned}）`;
+}
+
+function getPokecaRankWindowLabel(rankTarget: PokecaRankTarget): string {
 	if (rankTarget === "rank_rise_7" || rankTarget === "rank_fall_7") return "過去7日";
-	return null;
+	return "当日集計";
 }
 
-function getPokecaPostTitle(rankTarget: PokecaRankTarget): string {
-	if (rankTarget === "rank_fall_7") return "ポケカ相場下落ウォッチ";
-	if (rankTarget === "rank_vol") return "ポケカ注目取引ウォッチ";
-	return "ポケカ相場急騰ウォッチ";
+function getPokecaPostTitle(
+	rankTarget: PokecaRankTarget,
+	now = new Date(),
+	cards: PokecaSummaryCard[] = [],
+): string {
+	const jst = getJstNow(now);
+	const variant = jst.getUTCDate() % 3;
+	const topName = String(cards[0]?.cardName ?? "");
+	if (rankTarget === "rank_fall_7") {
+		const fallTitles = ["ポケカ下落トレンド監視", "ポケカ調整幅ウォッチ", "ポケカ下落アラート"];
+		return fallTitles[variant] ?? fallTitles[0];
+	}
+	if (rankTarget === "rank_vol") {
+		const volTitles = ["ポケカ取引注目ウォッチ", "ポケカ出来高トレンド", "ポケカ取引集中ランキング"];
+		return volTitles[variant] ?? volTitles[0];
+	}
+	if (/ピカチュウ/i.test(topName)) {
+		return "ポケカ上昇トレンド監視";
+	}
+	const riseTitles = ["ポケカ上昇トレンド監視", "ポケカ急伸ウォッチ", "ポケカ値動き上振れ速報"];
+	return riseTitles[variant] ?? riseTitles[0];
 }
 
 function buildPokecaSummaryImageAlt(cardName: string): string {
 	return `カード画像: ${String(cardName ?? "").trim()}`;
+}
+
+const TCGSTORE_LOGO_SVG = `<svg width="156" height="22" viewBox="0 0 156 22" fill="none" xmlns="http://www.w3.org/2000/svg"><g clip-path="url(#clip0_19_5)"><path d="M33.052 21.7042V7.5543H28.3076V4.14027H41.513V7.5543H36.718V21.7042H33.052Z" fill="white"/><path d="M50.3253 22.0002C47.646 22.0002 45.4211 21.126 43.6466 19.3777C41.8721 17.6294 40.9848 15.4776 40.9848 12.9224C40.9848 10.3672 41.8721 8.21345 43.6466 6.46706C45.4211 4.71874 47.646 3.84458 50.3253 3.84458C52.3494 3.84458 54.1707 4.42479 55.7853 5.58905C57.3999 6.7514 58.4588 8.26533 58.9619 10.1289H55.0209C54.6699 9.27205 54.0537 8.58617 53.1743 8.07512C52.2968 7.56408 51.3452 7.30855 50.3253 7.30855C48.6522 7.30855 47.2872 7.84458 46.2323 8.91662C45.1773 9.98867 44.6508 11.3239 44.6508 12.9243C44.6508 14.5247 45.1773 15.8599 46.2323 16.932C47.2872 18.004 48.6503 18.5401 50.3253 18.5401C51.3452 18.5401 52.2968 18.2845 53.1743 17.7735C54.0537 17.2624 54.668 16.5785 55.0209 15.7197H58.9619C58.4607 17.5833 57.3999 19.0972 55.7853 20.2596C54.1688 21.4219 52.3494 22.004 50.3253 22.004V22.0002Z" fill="white"/><path d="M69.7632 22C67.0683 22 64.8297 21.1258 63.0474 19.3775C61.2651 17.6292 60.3739 15.4774 60.3739 12.9222C60.3739 10.367 61.2612 8.21326 63.0357 6.46686C64.8102 4.71854 67.0352 3.84438 69.7145 3.84438C71.5884 3.84438 73.3083 4.35158 74.8741 5.36599C76.438 6.3804 77.5222 7.70413 78.1267 9.33525H73.9596C73.5247 8.70893 72.9261 8.21326 72.1656 7.85206C71.4031 7.48895 70.588 7.30836 69.7183 7.30836C68.0452 7.30836 66.6803 7.84438 65.6253 8.91643C64.5704 9.98847 64.0438 11.3237 64.0438 12.9241C64.0438 14.5245 64.5704 15.8597 65.6253 16.9318C66.6803 18.0038 68.0608 18.5399 69.7671 18.5399C71.1906 18.5399 72.3333 18.1902 73.1952 17.489C74.0571 16.7877 74.5895 15.8117 74.7903 14.5572H69.342V11.1931H78.5558C78.7566 12.9414 78.6649 14.5168 78.2788 15.9174C77.8927 17.3199 77.2824 18.4534 76.4458 19.318C75.6093 20.1844 74.6206 20.8473 73.4818 21.3103C72.343 21.7733 71.1048 22.0038 69.7651 22.0038L69.7632 22Z" fill="white"/><path d="M89.7434 21.9999C87.7173 21.9999 86.0852 21.4274 84.8469 20.2804C83.6087 19.1353 82.9554 17.7943 82.8891 16.2612H86.5298C86.6643 17.0373 87.0231 17.6348 87.6101 18.0537C88.197 18.4744 88.9068 18.6838 89.7453 18.6838C90.498 18.6838 91.1084 18.5225 91.5783 18.2016C92.0463 17.8808 92.2823 17.4466 92.2823 16.9029C92.2823 15.9307 91.4867 15.2199 89.8974 14.7761L88.0137 14.2323C86.5571 13.8193 85.4202 13.1776 84.5993 12.3034C83.7783 11.4293 83.3591 10.3419 83.3435 9.03926C83.3435 7.43888 83.8875 6.17471 84.9756 5.24291C86.0637 4.31112 87.5106 3.84618 89.3183 3.84618C91.1259 3.84618 92.6235 4.38605 93.7623 5.46578C94.9011 6.54551 95.5037 7.78662 95.57 9.18912H91.9547C91.7694 8.49556 91.436 7.98643 90.9504 7.65598C90.4649 7.32553 89.9208 7.16222 89.3183 7.16222C88.6494 7.16222 88.0995 7.30631 87.6744 7.5945C87.2493 7.88268 87.0251 8.2823 87.0095 8.79335C86.9919 9.32168 87.1674 9.75012 87.536 10.0806C87.9045 10.411 88.4739 10.6819 89.2442 10.8971L91.3268 11.4658C94.4058 12.3073 95.9463 14.0806 95.9463 16.7837C95.9463 18.3015 95.373 19.5503 94.2264 20.5321C93.0798 21.5138 91.5861 22.0037 89.7453 22.0037L89.7434 21.9999Z" fill="white"/><path d="M101.191 21.7042V7.5543H96.4467V4.14027H109.652V7.5543H104.857V21.7042H101.191Z" fill="white"/><path d="M124.83 19.3412C123.03 21.1145 120.859 22.0002 118.315 22.0002C115.77 22.0002 113.598 21.1145 111.8 19.3412C110 17.5679 109.101 15.4296 109.101 12.9224C109.101 10.4152 110 8.27685 111.8 6.50356C113.6 4.73026 115.77 3.84458 118.315 3.84458C120.859 3.84458 123.03 4.73026 124.83 6.50356C126.63 8.27685 127.528 10.4171 127.528 12.9224C127.528 15.4277 126.63 17.5698 124.83 19.3412ZM114.385 16.8916C115.466 17.9887 116.774 18.5362 118.315 18.5362C119.855 18.5362 121.164 17.9887 122.244 16.8916C123.324 15.7946 123.862 14.4728 123.862 12.9224C123.862 11.372 123.322 10.0482 122.244 8.95313C121.164 7.8561 119.853 7.30855 118.315 7.30855C116.776 7.30855 115.466 7.8561 114.385 8.95313C113.305 10.0501 112.765 11.3739 112.765 12.9224C112.765 14.4709 113.305 15.7965 114.385 16.8916Z" fill="white"/><path d="M128.936 21.7041V4.14025H135.765C137.387 4.14025 138.705 4.63401 139.719 5.62344C140.732 6.61287 141.239 7.85015 141.239 9.33334C141.239 11.6427 140.016 13.1681 137.573 13.9097L143.974 21.7022H139.581L133.454 14.3055H132.575V21.7022H128.934L128.936 21.7041ZM132.575 11.2392H135.336C136.04 11.2392 136.596 11.0701 137.005 10.732C137.415 10.3939 137.621 9.92892 137.621 9.33526C137.621 8.7416 137.417 8.27666 137.005 7.93852C136.594 7.60039 136.04 7.43132 135.336 7.43132H132.575V11.2411V11.2392Z" fill="white"/><path d="M144.903 21.7042V4.14027H156V7.5543H148.543V11.1662H154.495V14.5802H148.543V18.2901H156V21.7042H144.903Z" fill="white"/><path d="M22.3291 0V22H7.22656L20.2412 10.4902H15.1064V0.0136719L2.08301 11.5332H7.22656V22H0V0H22.3291Z" fill="white"/></g><defs><clipPath id="clip0_19_5"><rect width="156" height="22" fill="white"/></clipPath></defs></svg>`;
+
+function resolvePokecaSummaryCollageTitle(message: string, rankLabel: string): string {
+	const lines = String(message ?? "")
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.filter((line) => !/^#/.test(line))
+		.filter((line) => !/^\d+\./.test(line))
+		.filter((line) => !/^\d{1,2}\/\d{1,2}（/.test(line));
+	const picked = lines[0] ?? `${rankLabel} まとめ`;
+	return picked.replace(/【|】/g, "").slice(0, 48).trim() || `${rankLabel} まとめ`;
+}
+
+function drawFittedImageToRect(
+	ctx: any,
+	bitmap: any,
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+): void {
+	const sw = Number(bitmap?.width ?? bitmap?.displayWidth ?? 0);
+	const sh = Number(bitmap?.height ?? bitmap?.displayHeight ?? 0);
+	if (!Number.isFinite(sw) || !Number.isFinite(sh) || sw <= 0 || sh <= 0) return;
+	const scale = Math.max(w / sw, h / sh);
+	const dw = sw * scale;
+	const dh = sh * scale;
+	const dx = x + (w - dw) / 2;
+	const dy = y + (h - dh) / 2;
+	ctx.drawImage(bitmap, dx, dy, dw, dh);
+}
+
+async function decodeImageBitmapLike(
+	res: Response,
+	createImageBitmapFn: ((image: any) => Promise<any>) | undefined,
+): Promise<any | null> {
+	try {
+		const blob = await res.blob();
+		if (createImageBitmapFn) {
+			return await createImageBitmapFn(blob);
+		}
+		const ImageDecoderCtor = (globalThis as { ImageDecoder?: any }).ImageDecoder;
+		const contentType = String(res.headers.get("content-type") ?? "").toLowerCase();
+		if (!ImageDecoderCtor || !contentType.startsWith("image/")) return null;
+		const bytes = new Uint8Array(await blob.arrayBuffer());
+		const decoder = new ImageDecoderCtor({
+			data: bytes,
+			type: contentType,
+		});
+		const frame = await decoder.decode({ frameIndex: 0 });
+		return frame?.image ?? null;
+	} catch {
+		return null;
+	}
+}
+
+async function ensureResvgWasmReady(): Promise<boolean> {
+	if (resvgWasmInitPromise) return resvgWasmInitPromise;
+	resvgWasmInitPromise = (async () => {
+		try {
+			await initResvgWasm(resvgWasmBinary as unknown as BufferSource);
+			return true;
+		} catch {
+			return false;
+		}
+	})();
+	return resvgWasmInitPromise;
+}
+
+async function loadPokecaBannerFontBuffers(): Promise<Uint8Array[]> {
+	if (pokecaBannerFontBuffersPromise) return pokecaBannerFontBuffersPromise;
+	pokecaBannerFontBuffersPromise = (async () => {
+		const urls = [
+			"https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf",
+			"https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/Japanese/NotoSansCJKjp-Bold.otf",
+		];
+		const out: Uint8Array[] = [];
+		for (const u of urls) {
+			try {
+				const res = await fetch(u, { headers: { "user-agent": "Mozilla/5.0" } });
+				if (!res.ok) continue;
+				const ab = await res.arrayBuffer();
+				if (ab.byteLength > 0) out.push(new Uint8Array(ab));
+			} catch {
+				// ignore individual font failures
+			}
+		}
+		return out;
+	})();
+	return pokecaBannerFontBuffersPromise;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+	let binary = "";
+	const chunkSize = 0x8000;
+	for (let i = 0; i < bytes.length; i += chunkSize) {
+		const chunk = bytes.subarray(i, i + chunkSize);
+		for (let j = 0; j < chunk.length; j += 1) {
+			binary += String.fromCharCode(chunk[j]);
+		}
+	}
+	return btoa(binary);
+}
+
+function utf8ToBase64(value: string): string {
+	const encoded = new TextEncoder().encode(value);
+	return bytesToBase64(encoded);
+}
+
+async function renderPokecaBannerViaSvgResvg(
+	title: string,
+	cards: Array<{ url: string; cardName: string }>,
+): Promise<{ blob: Blob; altText: string } | null> {
+	lastPokecaCollageDebugReason = null;
+	const picked = cards.filter((c) => c.url).slice(0, 3);
+	if (picked.length === 0) {
+		lastPokecaCollageDebugReason = "no_cards";
+		return null;
+	}
+	const ready = await ensureResvgWasmReady();
+	if (!ready) {
+		lastPokecaCollageDebugReason = "resvg_wasm_init_failed";
+		return null;
+	}
+
+	const embeddedImages: Array<{ dataUrl: string; idx: number }> = [];
+	for (let i = 0; i < picked.length; i += 1) {
+		try {
+			const res = await fetch(picked[i].url, { headers: { "user-agent": "Mozilla/5.0" } });
+			if (!res.ok) continue;
+			const bytes = new Uint8Array(await res.arrayBuffer());
+			if (bytes.length === 0) continue;
+			const ct = String(res.headers.get("content-type") ?? "").toLowerCase();
+			const mime = ct.startsWith("image/") ? ct.split(";")[0] : "image/jpeg";
+			const dataUrl = `data:${mime};base64,${bytesToBase64(bytes)}`;
+			embeddedImages.push({ dataUrl, idx: i });
+		} catch {
+			// skip broken image
+		}
+	}
+	if (embeddedImages.length === 0) {
+		lastPokecaCollageDebugReason = "all_card_image_fetch_failed";
+		return null;
+	}
+	const fontBuffers = await loadPokecaBannerFontBuffers();
+
+	const slots = [
+		{ x: 21.5, y: 156, w: 170, h: 242 },
+		{ x: 210, y: 156, w: 170, h: 242 },
+		{ x: 398.5, y: 156, w: 170, h: 242 },
+	];
+
+	const clipDefs = embeddedImages
+		.map(({ idx }) => {
+			const s = slots[idx];
+			if (!s) return "";
+			return `<clipPath id="clip-${idx}"><rect x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" rx="12" ry="12"/></clipPath>`;
+		})
+		.join("");
+
+	const cardLayers = embeddedImages
+		.map(({ dataUrl, idx }) => {
+			const s = slots[idx];
+			if (!s) return "";
+			return `<image href="${dataUrl}" x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" preserveAspectRatio="xMidYMid slice" clip-path="url(#clip-${idx})"/>`;
+		})
+		.join("");
+
+	const slotRects = slots
+		.map(
+			(s) =>
+				`<rect x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" rx="12" ry="12" fill="rgba(255,255,255,0.92)"/>`,
+		)
+		.join("");
+	const logoDataUrl = `data:image/svg+xml;base64,${utf8ToBase64(TCGSTORE_LOGO_SVG)}`;
+
+	const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="459" viewBox="0 0 600 459">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="600" y2="459" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF732E"/>
+      <stop offset="52%" stop-color="#FA4573"/>
+      <stop offset="100%" stop-color="#5E54F2"/>
+    </linearGradient>
+    ${clipDefs}
+  </defs>
+  <rect x="0" y="0" width="600" height="459" fill="url(#bg)"/>
+  <ellipse cx="50" cy="20" rx="90" ry="90" fill="rgba(255,242,115,0.45)"/>
+  <ellipse cx="345" cy="55" rx="95" ry="95" fill="rgba(89,242,255,0.35)"/>
+  <ellipse cx="235" cy="430" rx="115" ry="90" fill="rgba(255,115,191,0.28)"/>
+  <rect x="20" y="18" width="549" height="86" rx="18" ry="18" fill="rgba(40,0,81,0.17)" stroke="rgba(255,255,255,0.36)"/>
+  <text x="300" y="54" fill="#FFFFFF" text-anchor="middle" font-size="25" font-weight="700" font-family="Inter, sans-serif">${escapeXmlText(title || "フリマ取引件数ランキング")}</text>
+  <text x="300" y="82" fill="#FFF7D1" text-anchor="middle" font-size="15" font-weight="700" font-family="Inter, sans-serif">注目カードはこちら！</text>
+  <text x="76" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">1st</text>
+  <text x="267.5" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">2nd</text>
+  <text x="452.5" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">3rd</text>
+  ${slotRects}
+  ${cardLayers}
+  <text x="26" y="437" fill="#FFFFFF" font-size="20" font-weight="700" font-family="Inter, sans-serif">#ポケカ</text>
+  <image href="${logoDataUrl}" x="413" y="412.5" width="156" height="22"/>
+</svg>`;
+
+	try {
+		const resvg = new Resvg(svg, {
+			fitTo: { mode: "width", value: 600 },
+			font: {
+				fontBuffers,
+				defaultFontFamily: "Noto Sans CJK JP",
+				sansSerifFamily: "Noto Sans CJK JP",
+				monospaceFamily: "Noto Sans CJK JP",
+			},
+		});
+		const rendered = resvg.render();
+		const png = rendered.asPng();
+		rendered.free?.();
+		resvg.free?.();
+		lastPokecaCollageDebugReason = "ok";
+		return {
+			blob: new Blob([png], { type: "image/png" }),
+			altText: `ポケカまとめコラージュ: ${title}`,
+		};
+	} catch {
+		lastPokecaCollageDebugReason = "resvg_render_failed";
+		return null;
+	}
+}
+
+function escapeXmlText(value: string): string {
+	return String(value ?? "")
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&apos;");
+}
+
+async function buildPokecaSummaryCollageImage(
+	title: string,
+	cards: Array<{ url: string; cardName: string }>,
+): Promise<{ blob: Blob; altText: string } | null> {
+	try {
+		lastPokecaCollageDebugReason = null;
+		const OffscreenCanvasCtor = (globalThis as { OffscreenCanvas?: any }).OffscreenCanvas;
+		const createImageBitmapFn = (globalThis as { createImageBitmap?: any }).createImageBitmap;
+		if (!OffscreenCanvasCtor) {
+			return await renderPokecaBannerViaSvgResvg(title, cards);
+		}
+		const picked = cards.filter((c) => c.url).slice(0, 3);
+		if (picked.length === 0) {
+			lastPokecaCollageDebugReason = "no_cards";
+			return null;
+		}
+		const bitmaps: any[] = [];
+		for (const item of picked) {
+			const res = await fetch(item.url, { headers: { "user-agent": "Mozilla/5.0" } });
+			if (!res.ok) continue;
+			const bmp = await decodeImageBitmapLike(res, createImageBitmapFn);
+			if (!bmp) continue;
+			bitmaps.push(bmp);
+		}
+		if (bitmaps.length === 0) {
+			lastPokecaCollageDebugReason = "all_card_image_decode_failed";
+			return null;
+		}
+
+		const scale = 2;
+		const sx = (v: number) => Math.round(v * scale);
+		const width = sx(600);
+		const height = sx(459);
+		const canvas = new OffscreenCanvasCtor(width, height);
+		const ctx = canvas.getContext("2d");
+		if (!ctx) return null;
+
+		const gradient = ctx.createLinearGradient(0, 0, width, height);
+		gradient.addColorStop(0, "#ff7330");
+		gradient.addColorStop(0.52, "#fa4573");
+		gradient.addColorStop(1, "#5e54f2");
+		ctx.fillStyle = gradient;
+		ctx.fillRect(0, 0, width, height);
+
+		// soft glow decorations
+		const glowA = ctx.createRadialGradient(sx(50), sx(20), sx(10), sx(50), sx(20), sx(120));
+		glowA.addColorStop(0, "rgba(255,242,115,0.45)");
+		glowA.addColorStop(1, "rgba(255,242,115,0)");
+		ctx.fillStyle = glowA;
+		ctx.fillRect(0, 0, width, height);
+		const glowB = ctx.createRadialGradient(sx(345), sx(55), sx(10), sx(345), sx(55), sx(130));
+		glowB.addColorStop(0, "rgba(89,242,255,0.35)");
+		glowB.addColorStop(1, "rgba(89,242,255,0)");
+		ctx.fillStyle = glowB;
+		ctx.fillRect(0, 0, width, height);
+		const glowC = ctx.createRadialGradient(sx(235), sx(540), sx(15), sx(235), sx(540), sx(140));
+		glowC.addColorStop(0, "rgba(255,115,191,0.28)");
+		glowC.addColorStop(1, "rgba(255,115,191,0)");
+		ctx.fillStyle = glowC;
+		ctx.fillRect(0, 0, width, height);
+
+		const headerX = sx(20);
+		const headerY = sx(18);
+		const headerW = sx(549);
+		const headerH = sx(86);
+		const headerR = sx(18);
+		ctx.fillStyle = "rgba(255,255,255,0.17)";
+		ctx.strokeStyle = "rgba(255,255,255,0.36)";
+		ctx.lineWidth = sx(1);
+		roundedRectPath(ctx, headerX, headerY, headerW, headerH, headerR);
+		ctx.fill();
+		ctx.stroke();
+
+		ctx.fillStyle = "#ffffff";
+		ctx.font = `700 ${sx(25)}px Inter, sans-serif`;
+		ctx.textBaseline = "middle";
+		ctx.textAlign = "center";
+		ctx.fillText("フリマ取引件数ランキング", width / 2, sx(50));
+		ctx.fillStyle = "#fff7d1";
+		ctx.font = `700 ${sx(15)}px Inter, sans-serif`;
+		ctx.fillText("注目カードはこちら！", width / 2, sx(79));
+
+		// rank labels
+		ctx.fillStyle = "#ffffff";
+		ctx.textAlign = "left";
+		ctx.textBaseline = "top";
+		ctx.font = `700 ${sx(30)}px "Space Mono", monospace`;
+		ctx.fillText("1st", sx(76), sx(112));
+		ctx.fillText("2nd", sx(267.5), sx(112));
+		ctx.fillText("3rd", sx(452.5), sx(112));
+
+		const slots = [
+			{ x: sx(21.5), y: sx(156), w: sx(170), h: sx(242) },
+			{ x: sx(210), y: sx(156), w: sx(170), h: sx(242) },
+			{ x: sx(398.5), y: sx(156), w: sx(170), h: sx(242) },
+		];
+		for (let i = 0; i < bitmaps.length; i += 1) {
+			const slot = slots[i];
+			if (!slot) break;
+			ctx.fillStyle = "rgba(255,255,255,0.92)";
+			roundedRectPath(ctx, slot.x, slot.y, slot.w, slot.h, sx(18));
+			ctx.fill();
+			ctx.save();
+			roundedRectPath(ctx, slot.x, slot.y, slot.w, slot.h, sx(18));
+			ctx.clip();
+			drawFittedImageToRect(ctx, bitmaps[i], slot.x, slot.y, slot.w, slot.h);
+			ctx.restore();
+		}
+
+		// sparkles
+		const dots = [
+			{ x: 16, y: 138, r: 5, c: "rgba(252,230,64,0.9)" },
+			{ x: 52, y: 124, r: 3, c: "rgba(89,245,255,0.9)" },
+			{ x: 368, y: 128, r: 4, c: "rgba(255,148,51,0.9)" },
+			{ x: 336, y: 112, r: 2.5, c: "rgba(255,255,255,0.9)" },
+			{ x: 292, y: 126, r: 3.5, c: "rgba(181,255,99,0.9)" },
+			{ x: 204, y: 118, r: 2.5, c: "rgba(255,191,242,0.9)" },
+		];
+		for (const d of dots) {
+			ctx.fillStyle = d.c;
+			ctx.beginPath();
+			ctx.arc(sx(d.x), sx(d.y), sx(d.r), 0, Math.PI * 2);
+			ctx.fill();
+		}
+
+		let logoBitmap: any = null;
+		try {
+			const logoBlob = new Blob([TCGSTORE_LOGO_SVG], { type: "image/svg+xml" });
+			if (createImageBitmapFn) {
+				logoBitmap = await createImageBitmapFn(logoBlob);
+			}
+		} catch {
+			logoBitmap = null;
+		}
+
+		ctx.fillStyle = "#ffffff";
+		ctx.textAlign = "left";
+		ctx.textBaseline = "top";
+		ctx.font = `700 ${sx(20)}px Inter, sans-serif`;
+		ctx.fillText("#ポケカ", sx(26), sx(412.5));
+		if (logoBitmap) {
+			ctx.drawImage(logoBitmap, sx(413), sx(412.5), sx(156), sx(22));
+			if (typeof logoBitmap.close === "function") logoBitmap.close();
+		} else {
+			ctx.textAlign = "right";
+			ctx.font = `700 ${sx(20)}px "Space Mono", Inter, sans-serif`;
+			ctx.fillText("TCGSTORE", sx(569), sx(412.5));
+		}
+
+		const out = await canvas.convertToBlob({ type: "image/png", quality: 0.92 });
+		for (const bmp of bitmaps) bmp.close();
+		return {
+			blob: out,
+			altText: `ポケカまとめコラージュ: ${title}`,
+		};
+	} catch {
+		lastPokecaCollageDebugReason = "offscreen_render_failed";
+		return null;
+	}
+}
+
+function roundedRectPath(
+	ctx: any,
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	r: number,
+): void {
+	const radius = Math.max(0, Math.min(r, Math.floor(Math.min(w, h) / 2)));
+	ctx.beginPath();
+	ctx.moveTo(x + radius, y);
+	ctx.lineTo(x + w - radius, y);
+	ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+	ctx.lineTo(x + w, y + h - radius);
+	ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+	ctx.lineTo(x + radius, y + h);
+	ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+	ctx.lineTo(x, y + radius);
+	ctx.quadraticCurveTo(x, y, x + radius, y);
+	ctx.closePath();
+}
+
+function pickPokecaConsecutiveRankIns(
+	todayCards: PokecaSummaryCard[],
+	yesterdayCards: PokecaSummaryCard[],
+): PokecaConsecutiveRankIn[] {
+	const yesterdayIndex = new Map<string, number>();
+	for (const [idx, card] of yesterdayCards.entries()) {
+		const key = String(card.cardName ?? "").trim();
+		if (!key) continue;
+		if (!yesterdayIndex.has(key)) yesterdayIndex.set(key, idx + 1);
+	}
+	const hits: PokecaConsecutiveRankIn[] = [];
+	for (const [idx, card] of todayCards.entries()) {
+		const key = String(card.cardName ?? "").trim();
+		if (!key) continue;
+		const yesterdayRank = yesterdayIndex.get(key);
+		if (!yesterdayRank) continue;
+		hits.push({
+			cardName: key,
+			todayRank: idx + 1,
+			yesterdayRank,
+		});
+	}
+	return hits;
+}
+
+function buildPokecaConsecutiveRankLine(
+	entries: PokecaConsecutiveRankIn[],
+	rankLabel: string,
+): string | null {
+	const rankTag = rankLabel.includes("下落")
+		? "下落7日"
+		: rankLabel.includes("高騰")
+			? "高騰7日"
+			: "取引件数";
+	const header = `2日連続ランクイン[${rankTag}]`;
+	if (entries.length === 0) {
+		return null;
+	}
+	const body = entries
+		.slice(0, 2)
+		.map((entry) => `${stripPokecaCardVariant(entry.cardName)}(${entry.yesterdayRank}→${entry.todayRank}位)`)
+		.join("、");
+	return `${header}: ${body}`;
+}
+
+function formatYmdMonthDay(ymd: string): string {
+	const v = String(ymd ?? "").trim();
+	const m = v.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+	if (!m) return "?/?";
+	return `${Number(m[2])}/${Number(m[3])}`;
+}
+
+function buildPokecaDailyDeltaEntries(
+	todayCards: PokecaSummaryCard[],
+	yesterdayCards: PokecaSummaryCard[],
+	rankTarget: PokecaRankTarget,
+): PokecaDailyDeltaEntry[] {
+	const toNameKey = (name: string): string =>
+		String(name ?? "")
+			.replace(/\s+/g, " ")
+			.trim()
+			.toLowerCase();
+	const toUrlKey = (url: string): string => {
+		try {
+			const u = new URL(String(url ?? ""));
+			return u.pathname.replace(/^\/+|\/+$/g, "").toLowerCase();
+		} catch {
+			return "";
+		}
+	};
+	const yesterdayMapByUrl = new Map<string, PokecaSummaryCard>();
+	const yesterdayMapByName = new Map<string, PokecaSummaryCard>();
+	for (const card of yesterdayCards) {
+		if (!Number.isFinite(card.price) || card.price <= 0) continue;
+		const urlKey = toUrlKey(card.url);
+		if (urlKey && !yesterdayMapByUrl.has(urlKey)) yesterdayMapByUrl.set(urlKey, card);
+		const nameKey = toNameKey(card.cardName);
+		if (nameKey && !yesterdayMapByName.has(nameKey)) yesterdayMapByName.set(nameKey, card);
+	}
+	const entries: PokecaDailyDeltaEntry[] = [];
+	for (const card of todayCards) {
+		if (!Number.isFinite(card.price) || card.price <= 0) continue;
+		const urlKey = toUrlKey(card.url);
+		const nameKey = toNameKey(card.cardName);
+		const y = (urlKey ? yesterdayMapByUrl.get(urlKey) : null) ?? (nameKey ? yesterdayMapByName.get(nameKey) : null);
+		if (!y || !Number.isFinite(y.price) || y.price <= 0) continue;
+		const deltaPrice = card.price - y.price;
+		const deltaPct = calcPercentChange(y.price, card.price);
+		entries.push({
+			cardName: card.cardName,
+			todayPrice: card.price,
+			yesterdayPrice: y.price,
+			deltaPrice,
+			deltaPct,
+		});
+	}
+	const sorted = [...entries].sort((a, b) => {
+		if (rankTarget === "rank_fall_7") return a.deltaPrice - b.deltaPrice;
+		if (rankTarget === "rank_vol") return Math.abs(b.deltaPrice) - Math.abs(a.deltaPrice);
+		return b.deltaPrice - a.deltaPrice;
+	});
+	if (rankTarget === "rank_fall_7") return sorted.filter((x) => x.deltaPrice < 0);
+	if (rankTarget === "rank_rise_7") return sorted.filter((x) => x.deltaPrice > 0);
+	return sorted;
+}
+
+function buildPokecaOriginalCandidates(
+	todayCards: PokecaSummaryCard[],
+	yesterdayCards: PokecaSummaryCard[],
+	prevDateKey: string,
+	dateKey: string,
+): PokecaOriginalCandidate[] {
+	if (!prevDateKey || !dateKey) return [];
+	const all = buildPokecaDailyDeltaEntries(todayCards, yesterdayCards, "rank_vol");
+	if (all.length < 3) return [];
+	const periodLine = `${formatYmdMonthDay(prevDateKey)}→${formatYmdMonthDay(dateKey)}`;
+	const upAmt = [...all].filter((x) => x.deltaPrice > 0).sort((a, b) => b.deltaPrice - a.deltaPrice).slice(0, 3);
+	const downAmt = [...all].filter((x) => x.deltaPrice < 0).sort((a, b) => a.deltaPrice - b.deltaPrice).slice(0, 3);
+	const upPct = [...all].filter((x) => x.deltaPct > 0).sort((a, b) => b.deltaPct - a.deltaPct).slice(0, 3);
+	const downPct = [...all].filter((x) => x.deltaPct < 0).sort((a, b) => a.deltaPct - b.deltaPct).slice(0, 3);
+	const candidates: PokecaOriginalCandidate[] = [];
+	if (upAmt.length >= 3) candidates.push({ key: "d1_up_amt", label: "前日比 上昇額ランキング TOP3", periodLine, rows: upAmt });
+	if (downAmt.length >= 3) candidates.push({ key: "d1_down_amt", label: "前日比 下落額ランキング TOP3", periodLine, rows: downAmt });
+	if (upPct.length >= 3) candidates.push({ key: "d1_up_pct", label: "前日比 上昇率ランキング TOP3", periodLine, rows: upPct });
+	if (downPct.length >= 3) candidates.push({ key: "d1_down_pct", label: "前日比 下落率ランキング TOP3", periodLine, rows: downPct });
+	return candidates;
+}
+
+function mergePokecaCardsUnique(cardGroups: PokecaSummaryCard[][]): PokecaSummaryCard[] {
+	const keyOf = (name: string): string =>
+		stripPokecaCardVariant(String(name ?? ""))
+			.replace(/\s+/g, " ")
+			.trim()
+			.toLowerCase();
+	const merged = new Map<string, PokecaSummaryCard>();
+	for (const group of cardGroups) {
+		for (const card of group) {
+			const key = keyOf(card.cardName);
+			if (!key || !Number.isFinite(card.price) || card.price <= 0) continue;
+			if (!merged.has(key)) merged.set(key, card);
+		}
+	}
+	return [...merged.values()];
+}
+
+function buildPokecaOriginalCandidateMessage(candidate: PokecaOriginalCandidate): { text: string; displayedCount: number } {
+	const rows = candidate.rows.slice(0, 3);
+	const lines = [
+		`【ポケカ${candidate.label}】`,
+		candidate.periodLine,
+		...rows.map(
+			(entry, idx) =>
+				`${idx + 1}. ${stripPokecaCardVariant(entry.cardName)} ${formatNumber(entry.todayPrice)}円（前日比 ${formatSignedNumber(entry.deltaPrice, "円")} / ${formatSignedPercent(entry.deltaPct)}）`,
+		),
+		"",
+		"#ポケカ",
+	];
+	return { text: lines.join("\n"), displayedCount: rows.length };
 }
 
 function formatJstDateLabel(now = new Date()): string {
@@ -1329,28 +3030,72 @@ function formatJstDateLabel(now = new Date()): string {
 	return `${month}/${day}`;
 }
 
+function formatSignedNumber(value: number, suffix = ""): string {
+	if (!Number.isFinite(value)) return `0${suffix}`;
+	if (value > 0) return `+${formatNumber(Math.round(value))}${suffix}`;
+	if (value < 0) return `-${formatNumber(Math.abs(Math.round(value)))}${suffix}`;
+	return `0${suffix}`;
+}
+
+function formatSignedPercent(value: number): string {
+	if (!Number.isFinite(value)) return "0.00%";
+	const abs = Math.abs(value).toFixed(2);
+	if (value > 0) return `+${abs}%`;
+	if (value < 0) return `-${abs}%`;
+	return "0.00%";
+}
+
+function buildPokecaChangeText(card: PokecaSummaryCard): string | null {
+	const hasPriceDelta = typeof card.riseFallPrice7 === "number" && Number.isFinite(card.riseFallPrice7);
+	const hasRate = typeof card.riseFallRate7 === "number" && Number.isFinite(card.riseFallRate7);
+	if (!hasPriceDelta && !hasRate) return null;
+	const parts: string[] = [];
+	const baseDelta = hasPriceDelta ? (card.riseFallPrice7 as number) : (card.riseFallRate7 as number);
+	const direction = baseDelta > 0 ? "↗" : baseDelta < 0 ? "↘" : "→";
+	if (hasPriceDelta) parts.push(formatSignedNumber(card.riseFallPrice7 as number, "円"));
+	if (hasRate) parts.push(formatSignedPercent(card.riseFallRate7 as number));
+	return `7日変動${direction} ${parts.join(" / ")}`;
+}
+
+function buildPokecaSummaryRankLine(
+	card: PokecaSummaryCard,
+	index: number,
+	rankTarget: PokecaRankTarget,
+): string {
+	if (rankTarget === "rank_vol") {
+		return `${index + 1}. ${card.cardName}（参考価格 ${formatNumber(card.price)}円）`;
+	}
+	const changeText = buildPokecaChangeText(card);
+	return changeText
+		? `${index + 1}. ${card.cardName} ${formatNumber(card.price)}円（${changeText}）`
+		: `${index + 1}. ${card.cardName} ${formatNumber(card.price)}円`;
+}
+
 function buildPokecaSummaryMessage(
 	cards: PokecaSummaryCard[],
 	rankLabel: string,
 	rankTarget: PokecaRankTarget,
 	now = new Date(),
+	options: {
+		leadOverride?: string | null;
+		consecutiveLine?: string | null;
+	} = {},
 ): { text: string; displayedCount: number } {
 	const fullTopCards = cards.slice(0, POKECA_POST_RANK_LIMIT);
-	const lead = buildPokecaSummaryLead(fullTopCards, rankTarget, now);
-	const postTitle = getPokecaPostTitle(rankTarget);
+	const lead = options.leadOverride ?? buildPokecaSummaryLead(fullTopCards, rankTarget, now);
+	const consecutiveLine = String(options.consecutiveLine ?? "").trim() || null;
+	const postTitle = getPokecaPostTitle(rankTarget, now, fullTopCards);
 	const rankWindow = getPokecaRankWindowLabel(rankTarget);
 	const dateLabel = formatJstDateLabel(now);
-	const collectedLine = rankWindow
-		? `${dateLabel}（${rankWindow}）`
-		: dateLabel;
-	const rankCountCandidates = [POKECA_POST_RANK_LIMIT, 8, 5, 4, 3, 2, 1].filter(
+	const collectedLine = `${dateLabel}（${rankWindow}）`;
+	const rankCountCandidates = [POKECA_POST_RANK_LIMIT, 8, 5, 4, 3].filter(
 		(n, i, arr) => n > 0 && cards.length >= n && arr.indexOf(n) === i,
 	);
-	const templates: Array<{ includeLead: boolean; includeCollectedLine: boolean }> = [
-		{ includeLead: true, includeCollectedLine: true },
-		{ includeLead: true, includeCollectedLine: false },
-		{ includeLead: false, includeCollectedLine: true },
-		{ includeLead: false, includeCollectedLine: false },
+	const templates: Array<{ includeLead: boolean; includeCollectedLine: boolean; includeConsecutiveLine: boolean }> = [
+		{ includeLead: true, includeCollectedLine: true, includeConsecutiveLine: true },
+		{ includeLead: true, includeCollectedLine: false, includeConsecutiveLine: true },
+		{ includeLead: false, includeCollectedLine: true, includeConsecutiveLine: true },
+		{ includeLead: false, includeCollectedLine: false, includeConsecutiveLine: true },
 	];
 
 	for (const rankCount of rankCountCandidates) {
@@ -1361,11 +3106,14 @@ function buildPokecaSummaryMessage(
 			if (template.includeCollectedLine) {
 				lines.push(collectedLine, "");
 			}
+			if (template.includeConsecutiveLine && consecutiveLine) {
+				lines.push(consecutiveLine, "");
+			}
 			if (template.includeLead && lead) {
-				lines.push(lead, "");
+				lines.push(formatPokecaSummaryLeadLine(lead), "");
 			}
 			for (const [idx, card] of selectedCards.entries()) {
-				lines.push(`${idx + 1}. ${card.cardName} ${formatNumber(card.price)}円`);
+				lines.push(buildPokecaSummaryRankLine(card, idx, rankTarget));
 			}
 			lines.push("", "#ポケカ");
 			const text = lines.join("\n");
@@ -1379,9 +3127,182 @@ function buildPokecaSummaryMessage(
 	const fallbackCards = cards.slice(0, fallbackCount);
 	const fallbackHeader = `【${postTitle} TOP${fallbackCount}】`;
 	const fallbackLines = [fallbackHeader];
-	fallbackLines.push(...fallbackCards.map((card, idx) => `${idx + 1}. ${card.cardName} ${formatNumber(card.price)}円`));
+	if (consecutiveLine) {
+		fallbackLines.push(consecutiveLine, "");
+	}
+	fallbackLines.push(
+		...fallbackCards.map((card, idx) => buildPokecaSummaryRankLine(card, idx, rankTarget)),
+	);
 	fallbackLines.push("", "#ポケカ");
-	return { text: fallbackLines.join("\n"), displayedCount: fallbackCards.length };
+	const fallbackText = fallbackLines.join("\n");
+	if (countXWeightedLength(fallbackText) <= POKECA_TWEET_TEXT_LIMIT) {
+		return { text: fallbackText, displayedCount: fallbackCards.length };
+	}
+
+	// 最終フォールバック:
+	// 1) 期間行は必ず残す
+	// 2) 高騰/下落は「上昇(下落)額」を必ず残す（可能なら率も残す）
+	// 3) その上でTOP3優先で280字内に収める
+	const compactChange = (
+		card: PokecaSummaryCard,
+		mode: "delta_rate" | "delta_only",
+	): string | null => {
+		const hasPriceDelta = typeof card.riseFallPrice7 === "number" && Number.isFinite(card.riseFallPrice7);
+		if (!hasPriceDelta) return null;
+		const delta = formatSignedNumber(card.riseFallPrice7 as number, "円");
+		if (mode === "delta_only") return delta;
+		const hasRate = typeof card.riseFallRate7 === "number" && Number.isFinite(card.riseFallRate7);
+		if (!hasRate) return delta;
+		return `${delta}/${formatSignedPercent(card.riseFallRate7 as number)}`;
+	};
+
+	const compactRankLine = (
+		card: PokecaSummaryCard,
+		index: number,
+		mode: "delta_rate" | "delta_only",
+	): string => {
+		const name = stripPokecaCardVariant(card.cardName);
+		if (rankTarget === "rank_vol") {
+			return `${index + 1}. ${name} 参考${formatNumber(card.price)}円`;
+		}
+		const compact = compactChange(card, mode);
+		if (compact) {
+			return `${index + 1}. ${name} ${formatNumber(card.price)}円（${compact}）`;
+		}
+		return `${index + 1}. ${name} ${formatNumber(card.price)}円`;
+	};
+
+	const compactCountCandidates = [3, 2, 1].filter((n) => cards.length >= n);
+	const compactModes: Array<"delta_rate" | "delta_only"> =
+		rankTarget === "rank_vol" ? ["delta_only"] : ["delta_rate", "delta_only"];
+	for (const compactMode of compactModes) {
+		for (const compactCount of compactCountCandidates) {
+			const compactCards = cards.slice(0, compactCount);
+			const compactHeader = `【${postTitle} TOP${compactCount}】`;
+			const compactLines = [
+				compactHeader,
+				collectedLine,
+				...compactCards.map((card, idx) => compactRankLine(card, idx, compactMode)),
+				"",
+				"#ポケカ",
+			];
+			const compactText = compactLines.join("\n");
+			if (countXWeightedLength(compactText) <= POKECA_TWEET_TEXT_LIMIT) {
+				return { text: compactText, displayedCount: compactCards.length };
+			}
+		}
+	}
+
+	return { text: fallbackText, displayedCount: fallbackCards.length };
+}
+
+function buildPokecaSummaryOriginalMessage(
+	cards: PokecaSummaryCard[],
+	rankLabel: string,
+	rankTarget: PokecaRankTarget,
+	now = new Date(),
+	options: {
+		consecutiveLine?: string | null;
+		prevCards?: PokecaSummaryCard[];
+		prevDateKey?: string;
+		dateKey?: string;
+	} = {},
+): { text: string; displayedCount: number } {
+	const topCards = cards.slice(0, Math.min(3, cards.length));
+	const displayedCount = topCards.length;
+	const dateLabel = formatJstDateLabel(now);
+	const collectedLine = rankTarget === "rank_rise_7" || rankTarget === "rank_fall_7" ? `${dateLabel}時点` : `${dateLabel}（当日集計）`;
+	const consecutiveLine = String(options.consecutiveLine ?? "").trim();
+	const prevCards = Array.isArray(options.prevCards) ? options.prevCards : [];
+	const prevDateKey = String(options.prevDateKey ?? "").trim();
+	const dateKey = String(options.dateKey ?? "").trim();
+
+	if (prevCards.length > 0 && prevDateKey && dateKey) {
+		const deltaEntries = buildPokecaDailyDeltaEntries(cards, prevCards, rankTarget).slice(0, 3);
+		if (deltaEntries.length >= 3) {
+			const periodLine = `${formatYmdMonthDay(prevDateKey)}→${formatYmdMonthDay(dateKey)}`;
+			const title =
+				rankTarget === "rank_fall_7"
+					? "前日比下落額ランキング TOP3"
+					: rankTarget === "rank_vol"
+						? "前日比変動額ランキング TOP3"
+						: "前日比上昇額ランキング TOP3";
+			const lines = [
+				`【ポケカ${title}】`,
+				periodLine,
+				...deltaEntries.map(
+					(entry, idx) =>
+						`${idx + 1}. ${stripPokecaCardVariant(entry.cardName)} ${formatNumber(entry.todayPrice)}円（前日比 ${formatSignedNumber(entry.deltaPrice, "円")} / ${formatSignedPercent(entry.deltaPct)}）`,
+				),
+				"",
+				"#ポケカ",
+			];
+			const text = lines.join("\n");
+			if (countXWeightedLength(text) <= POKECA_TWEET_TEXT_LIMIT) {
+				return { text, displayedCount: deltaEntries.length };
+			}
+		}
+	}
+
+	const compactRankLine = (card: PokecaSummaryCard, index: number, includeRate: boolean): string => {
+		const name = stripPokecaCardVariant(card.cardName);
+		if (rankTarget === "rank_vol") {
+			return `${index + 1}. ${name} ${formatNumber(card.price)}円`;
+		}
+		const hasDelta = typeof card.riseFallPrice7 === "number" && Number.isFinite(card.riseFallPrice7);
+		const hasRate = typeof card.riseFallRate7 === "number" && Number.isFinite(card.riseFallRate7);
+		const deltaText = hasDelta ? formatSignedNumber(card.riseFallPrice7 as number, "円") : null;
+		const rateText = hasRate ? formatSignedPercent(card.riseFallRate7 as number) : null;
+		if (deltaText && includeRate && rateText) {
+			return `${index + 1}. ${name} ${formatNumber(card.price)}円（${deltaText}/${rateText}）`;
+		}
+		if (deltaText) {
+			return `${index + 1}. ${name} ${formatNumber(card.price)}円（${deltaText}）`;
+		}
+		if (rateText) {
+			return `${index + 1}. ${name} ${formatNumber(card.price)}円（${rateText}）`;
+		}
+		return `${index + 1}. ${name} ${formatNumber(card.price)}円`;
+	};
+
+	const fallbackTitle =
+		rankTarget === "rank_fall_7"
+			? "下落ランキング TOP3"
+			: rankTarget === "rank_vol"
+				? "取引件数ランキング TOP3"
+				: "高騰ランキング TOP3";
+
+	const lineVariants: Array<{ includeRate: boolean; includeConsecutive: boolean }> = [
+		{ includeRate: true, includeConsecutive: true },
+		{ includeRate: true, includeConsecutive: false },
+		{ includeRate: false, includeConsecutive: false },
+	];
+
+	for (const variant of lineVariants) {
+		const lines: string[] = [];
+		lines.push(`【ポケカ${fallbackTitle}】`);
+		lines.push(collectedLine);
+		if (variant.includeConsecutive && consecutiveLine) {
+			lines.push(consecutiveLine);
+		}
+		for (const [idx, card] of topCards.entries()) {
+			lines.push(compactRankLine(card, idx, variant.includeRate));
+		}
+		lines.push("", "#ポケカ");
+		const text = lines.join("\n");
+		if (countXWeightedLength(text) <= POKECA_TWEET_TEXT_LIMIT) {
+			return { text, displayedCount };
+		}
+	}
+
+	const fallbackLines = [
+		`【ポケカ${rankLabel}】`,
+		collectedLine,
+		...topCards.map((card, idx) => compactRankLine(card, idx, false)),
+		"",
+		"#ポケカ",
+	];
+	return { text: fallbackLines.join("\n"), displayedCount };
 }
 
 function hexToBytes(hex: string): Uint8Array {
@@ -1473,11 +3394,18 @@ function pickPokecaCardsFromRank(items: PokecaApiItem[], rank: PokecaRankTarget)
 		const cardName = String(item.strName ?? "").trim();
 		const price = getPokecaSummaryPrice(item);
 		if (!slug || !cardName || price == null) continue;
+		const priceInfo0 = item.arrayPriceInfo?.["0"];
+		const riseFallRate7Raw = Number(priceInfo0?.fRiseFallRate7 ?? NaN);
+		const riseFallRate7 = Number.isFinite(riseFallRate7Raw) ? riseFallRate7Raw : null;
+		const riseFallPrice7Raw = Number(priceInfo0?.nRiseFallPrice7 ?? NaN);
+		const riseFallPrice7 = Number.isFinite(riseFallPrice7Raw) ? riseFallPrice7Raw : null;
 		const imageUrlRaw = String(item.strImgUrl ?? "").trim();
 		const imageUrl = imageUrlRaw && /^https?:\/\//i.test(imageUrlRaw) ? imageUrlRaw : null;
 		cards.push({
 			cardName,
 			price,
+			riseFallRate7,
+			riseFallPrice7,
 			imageUrl,
 			url: normalizePokecaCardUrl(slug),
 			fetchedAt: nowIso,
@@ -1489,11 +3417,39 @@ function pickPokecaCardsFromRank(items: PokecaApiItem[], rank: PokecaRankTarget)
 async function runPokecaSummaryDebug(): Promise<Record<string, unknown>> {
 	const items = await fetchPokecaApiItems();
 	const riseCards = pickPokecaCardsFromRank(items, "rank_rise_7").slice(0, 3);
+	const canvasSupport = {
+		offscreenCanvas: typeof (globalThis as any).OffscreenCanvas !== "undefined",
+		createImageBitmap: typeof (globalThis as any).createImageBitmap !== "undefined",
+		imageDecoder: typeof (globalThis as any).ImageDecoder !== "undefined",
+	};
+	let collageCheck: { attempted: boolean; ok: boolean; reason?: string } = { attempted: false, ok: false };
+	try {
+		const testCards = riseCards
+			.filter((c) => c.imageUrl)
+			.slice(0, 3)
+			.map((c) => ({ url: c.imageUrl as string, cardName: c.cardName }));
+		if (testCards.length >= 1) {
+			collageCheck.attempted = true;
+			const blob = await buildPokecaSummaryCollageImage("debug", testCards);
+			collageCheck.ok = Boolean(blob);
+			if (!blob) collageCheck.reason = lastPokecaCollageDebugReason ?? "buildPokecaSummaryCollageImage_returned_null";
+		} else {
+			collageCheck.reason = "no_test_images";
+		}
+	} catch (e) {
+		collageCheck = {
+			attempted: true,
+			ok: false,
+			reason: e instanceof Error ? e.message : "unknown_error",
+		};
+	}
 	return {
 		ok: true,
 		mode: "pokeca_summary_debug",
 		apiUrl: POKECA_CHART_API_URL,
 		items: items.length,
+		canvasSupport,
+		collageCheck,
 		topRise3: riseCards.map((card, idx) => ({
 			rank: idx + 1,
 			cardName: card.cardName,
@@ -1561,6 +3517,30 @@ async function loadPokecaSummarySnapshot(
 	}
 }
 
+async function loadRecentPokecaSummarySnapshotForComparison(
+	stateStore: StateStore,
+	now: Date,
+	rankTarget: PokecaRankTarget,
+	maxDaysBack = 14,
+): Promise<{ dateKey: string; snapshot: PokecaSummarySnapshot } | null> {
+	for (let days = 1; days <= maxDaysBack; days += 1) {
+		const key = getJstYmdShifted(now, -days);
+		const snapshot = await loadPokecaSummarySnapshot(stateStore, key, rankTarget);
+		if (snapshot) {
+			return { dateKey: key, snapshot };
+		}
+	}
+	return null;
+}
+
+function hasPokecaChangeMetrics(cards: PokecaSummaryCard[]): boolean {
+	return cards.some(
+		(card) =>
+			(typeof card.riseFallPrice7 === "number" && Number.isFinite(card.riseFallPrice7)) ||
+			(typeof card.riseFallRate7 === "number" && Number.isFinite(card.riseFallRate7)),
+	);
+}
+
 async function archivePokecaSummaryImages(
 	cards: PokecaSummaryCard[],
 	dateKey: string,
@@ -1623,6 +3603,7 @@ async function runPokecaSummary(
 		fromSchedule?: boolean;
 		rank?: string | null;
 		imageLimit?: number;
+		templateImageUrl?: string | null;
 		preferStoredSnapshot?: boolean;
 		persistSnapshotOnly?: boolean;
 		persistFetchedSnapshot?: boolean;
@@ -1635,6 +3616,7 @@ async function runPokecaSummary(
 		fromSchedule = false,
 		rank,
 		imageLimit,
+		templateImageUrl,
 		preferStoredSnapshot = false,
 		persistSnapshotOnly = false,
 		persistFetchedSnapshot = true,
@@ -1644,10 +3626,21 @@ async function runPokecaSummary(
 	const now = new Date();
 	const jstNow = getJstNow(now);
 	const dateKey = getJstYmd(now);
-	const { rankTarget, rankSource } = resolvePokecaRankTarget(rank, jstNow);
+	const resolvedRank = resolvePokecaRankTarget(rank, jstNow);
+	let rankTarget = resolvedRank.rankTarget;
+	let rankSource: "param" | "auto_weekday" | "default" | "ai_theme" = resolvedRank.rankSource;
+	if (!rank && rankSource !== "param") {
+		const aiPick = await choosePokecaRankTargetByAi(env, stateStore, now);
+		if (aiPick.ok && aiPick.rankTarget) {
+			rankTarget = aiPick.rankTarget;
+			rankSource = "ai_theme";
+		}
+	}
 	const rankLabel = getPokecaRankLabel(rankTarget);
 	const kvKey = getPokecaSummaryDailyKey(dateKey, rankTarget);
+	const prevDateKey = getJstYmdShifted(now, -1);
 	let cards: PokecaSummaryCard[] | null = null;
+	let currentItems: PokecaApiItem[] | null = Array.isArray(preloadedItems) ? preloadedItems : null;
 	let fetchedCount = 0;
 	let archive = { archived: 0, skipped: 0, failed: 0 };
 	let snapshotSource: "stored" | "fetched" = "fetched";
@@ -1658,11 +3651,17 @@ async function runPokecaSummary(
 			cards = snapshot.cards;
 			fetchedCount = snapshot.apiItemCount;
 			snapshotSource = "stored";
+			const requiresChangeMetrics = rankTarget === "rank_rise_7" || rankTarget === "rank_fall_7";
+			if (requiresChangeMetrics && !hasPokecaChangeMetrics(cards)) {
+				cards = null;
+				snapshotSource = "fetched";
+			}
 		}
 	}
 
 	if (!cards) {
-		const items = Array.isArray(preloadedItems) ? preloadedItems : await fetchPokecaApiItems();
+		const items = currentItems ?? (await fetchPokecaApiItems());
+		currentItems = items;
 		fetchedCount = items.length;
 		cards = pickPokecaCardsFromRank(items, rankTarget).slice(0, POKECA_SNAPSHOT_TOP_LIMIT);
 		if (persistFetchedSnapshot) {
@@ -1719,15 +3718,123 @@ async function runPokecaSummary(
 		return result;
 	}
 	const rankedCards = cards.slice(0, POKECA_POST_RANK_LIMIT);
-	const { text: message, displayedCount } = buildPokecaSummaryMessage(rankedCards, rankLabel, rankTarget, now);
+	const comparisonSnapshot = await loadRecentPokecaSummarySnapshotForComparison(stateStore, now, rankTarget);
+	const comparisonDateKey = comparisonSnapshot?.dateKey ?? prevDateKey;
+	const previousCards = comparisonSnapshot?.snapshot.cards?.slice(0, POKECA_SNAPSHOT_TOP_LIMIT) ?? [];
+	const previousTopCards = previousCards.slice(0, POKECA_POST_RANK_LIMIT);
+	const consecutiveEntries = pickPokecaConsecutiveRankIns(rankedCards, previousTopCards);
+	const consecutiveLine = buildPokecaConsecutiveRankLine(consecutiveEntries, rankLabel);
+	let originalCandidates = buildPokecaOriginalCandidates(cards, previousCards, comparisonDateKey, dateKey);
+	if (originalCandidates.length === 0) {
+		try {
+			const itemsForOriginal = currentItems ?? (await fetchPokecaApiItems());
+			const todayUnionCards = mergePokecaCardsUnique(
+				POKECA_SNAPSHOT_RANK_TARGETS.map((target) =>
+					pickPokecaCardsFromRank(itemsForOriginal, target).slice(0, POKECA_SNAPSHOT_TOP_LIMIT),
+				),
+			);
+			const baseComparison = (await loadRecentPokecaSummarySnapshotForComparison(stateStore, now, "rank_vol")) ?? comparisonSnapshot;
+			const baseComparisonDateKey = baseComparison?.dateKey ?? comparisonDateKey;
+			const previousUnionCards = mergePokecaCardsUnique(
+				(
+					await Promise.all(
+						POKECA_SNAPSHOT_RANK_TARGETS.map(async (target) => {
+							const snapshot = await loadPokecaSummarySnapshot(stateStore, baseComparisonDateKey, target);
+							return snapshot?.cards?.slice(0, POKECA_SNAPSHOT_TOP_LIMIT) ?? [];
+						}),
+					)
+				).filter((group) => group.length > 0),
+			);
+			const unionCandidates = buildPokecaOriginalCandidates(
+				todayUnionCards,
+				previousUnionCards,
+				baseComparisonDateKey,
+				dateKey,
+			);
+			if (unionCandidates.length > 0) originalCandidates = unionCandidates;
+		} catch {
+			// keep base candidates
+		}
+	}
+	let selectedOriginalCandidate: PokecaOriginalCandidate | null = null;
+	if (originalCandidates.length > 0) {
+		const lastFingerprint = String((await stateStore.get(POKECA_SUMMARY_LAST_POST_FINGERPRINT_KEY)) ?? "").trim();
+		const aiCandidatePick = await choosePokecaOriginalCandidateByAi(env, stateStore, now, originalCandidates);
+		if (aiCandidatePick.ok && aiCandidatePick.key) {
+			selectedOriginalCandidate = originalCandidates.find((c) => c.key === aiCandidatePick.key) ?? originalCandidates[0];
+		} else {
+			selectedOriginalCandidate = originalCandidates[0];
+		}
+		if (selectedOriginalCandidate && lastFingerprint) {
+			const currentFp = buildPokecaCandidateFingerprint(selectedOriginalCandidate);
+			if (currentFp === lastFingerprint) {
+				const alt = originalCandidates.find((c) => buildPokecaCandidateFingerprint(c) !== lastFingerprint);
+				if (alt) selectedOriginalCandidate = alt;
+			}
+		}
+	}
+	const built = selectedOriginalCandidate
+		? buildPokecaOriginalCandidateMessage(selectedOriginalCandidate)
+		: buildPokecaSummaryOriginalMessage(rankedCards, rankLabel, rankTarget, now, {
+				consecutiveLine,
+				prevCards: previousCards,
+				prevDateKey: comparisonDateKey,
+				dateKey,
+		  });
+	let message = built.text;
+	const displayedCount = built.displayedCount;
+	let postCards = rankedCards;
+	if (selectedOriginalCandidate) {
+		const byName = new Map(cards.map((c) => [String(c.cardName ?? "").trim(), c] as const));
+		const picked = selectedOriginalCandidate.rows
+			.map((r) => byName.get(String(r.cardName ?? "").trim()))
+			.filter((c): c is PokecaSummaryCard => Boolean(c))
+			.slice(0, 3);
+		if (picked.length > 0) {
+			postCards = [...picked, ...rankedCards.filter((c) => !picked.includes(c))].slice(0, POKECA_POST_RANK_LIMIT);
+		}
+	}
+	const aiBodyResult: { ok: boolean; reason?: string; model?: string | null } = {
+		ok: false,
+		reason: "original_style_builder_enabled",
+		model: null,
+	};
+	const aiLeadResult: { ok: boolean; reason?: string; model?: string | null } = {
+		ok: false,
+		reason: "original_style_builder_enabled",
+		model: null,
+	};
+	const accentRankLabel = selectedOriginalCandidate?.label ?? rankLabel;
+	const aiAccentResult = await generatePokecaSummaryAiAccent(env, {
+		rankLabel: accentRankLabel,
+		rankTarget,
+		cards: postCards,
+	});
+	const accentLine =
+		aiAccentResult.ok && aiAccentResult.line ? aiAccentResult.line : getDefaultAccentLine(rankTarget, accentRankLabel);
+	message = applyPokecaSummaryAccentLine(message, accentLine);
 	const resolvedImageLimit =
 		typeof imageLimit === "number"
 			? Math.max(0, Math.min(3, Math.trunc(imageLimit)))
 			: POKECA_POST_IMAGE_LIMIT;
-	const imageItems = rankedCards
+	// フォールバック添付用（コラージュ失敗時）の画像候補
+	const imageItems = postCards
 		.filter((c) => c.imageUrl)
 		.slice(0, resolvedImageLimit)
 		.map((c) => ({ url: c.imageUrl!, alt: buildPokecaSummaryImageAlt(c.cardName) }));
+	// コラージュ用は常に上位3枚を試す
+	const collageSourceItems = postCards
+		.filter((c) => c.imageUrl)
+		.slice(0, 3)
+		.map((c) => ({ url: c.imageUrl!, alt: buildPokecaSummaryImageAlt(c.cardName) }));
+	const resolvedTemplateImageUrl = resolvePokecaSummaryTemplateImageUrl(env, templateImageUrl ?? null);
+	const collageTitle = resolvePokecaSummaryCollageTitle(message, rankLabel);
+	const collage = resolvedTemplateImageUrl
+		? null
+		: await buildPokecaSummaryCollageImage(
+				collageTitle,
+				collageSourceItems.map((x) => ({ url: x.url, cardName: x.alt })),
+		  );
 
 	let postedToX = false;
 	let xResponse: unknown = null;
@@ -1735,19 +3842,38 @@ async function runPokecaSummary(
 		const postResult = await postTweetWithImages(
 			message,
 			{
-				mainImageUrl: imageItems[0]?.url ?? null,
-				lastOneImageUrl: imageItems[1]?.url ?? null,
+				mainImageUrl: resolvedTemplateImageUrl || (collage ? null : (imageItems[0]?.url ?? null)),
+				lastOneImageUrl: resolvedTemplateImageUrl ? null : (collage ? null : (imageItems[1]?.url ?? null)),
 			},
 			env,
 			{
-				mainImageAlt: imageItems[0]?.alt ?? null,
-				lastOneImageAlt: imageItems[1]?.alt ?? null,
-				additionalImageUrls: imageItems.slice(2).map((x) => x.url),
-				additionalImageAlts: imageItems.slice(2).map((x) => x.alt),
+				mainImageAlt: resolvedTemplateImageUrl
+					? `ポケカまとめ画像: ${collageTitle}`
+					: collage
+						? null
+						: (imageItems[0]?.alt ?? null),
+				lastOneImageAlt: resolvedTemplateImageUrl ? null : collage ? null : (imageItems[1]?.alt ?? null),
+				additionalImageUrls: resolvedTemplateImageUrl ? [] : collage ? [] : imageItems.slice(2).map((x) => x.url),
+				additionalImageAlts: resolvedTemplateImageUrl
+					? []
+					: collage
+						? []
+						: imageItems.slice(2).map((x) => x.alt),
+				inlineImages: collage ? [{ blob: collage.blob, altText: collage.altText }] : [],
 			},
 		);
 		postedToX = postResult.ok;
 		xResponse = postResult;
+		if (postedToX) {
+			await appendPokecaThemeHistory(stateStore, rankTarget);
+			if (selectedOriginalCandidate) {
+				await appendPokecaOriginalThemeHistory(stateStore, selectedOriginalCandidate.key);
+				await stateStore.put(
+					POKECA_SUMMARY_LAST_POST_FINGERPRINT_KEY,
+					buildPokecaCandidateFingerprint(selectedOriginalCandidate),
+				);
+			}
+		}
 	}
 
 	const result = {
@@ -1763,12 +3889,31 @@ async function runPokecaSummary(
 		rankLabel,
 		fetchedCount,
 		displayedCount,
+		consecutiveRankInCount: consecutiveEntries.length,
+		consecutiveRankInLine: consecutiveLine,
+		aiBodyUsed: aiBodyResult.ok,
+		aiBodyReason: aiBodyResult.ok ? null : aiBodyResult.reason ?? "pokeca_ai_body_fallback",
+		aiBodyModel: aiBodyResult.model ?? null,
+		aiLeadUsed: aiLeadResult.ok,
+		aiLeadReason: aiLeadResult.ok ? null : aiLeadResult.reason ?? "pokeca_ai_fallback",
+		aiLeadModel: aiLeadResult.model ?? null,
+		aiAccentUsed: aiAccentResult.ok,
+		aiAccentReason: aiAccentResult.ok ? null : aiAccentResult.reason ?? "pokeca_ai_accent_fallback",
+		aiAccentModel: aiAccentResult.model ?? null,
 		archive,
 		snapshotKey: kvKey,
 		snapshotSource,
+		comparisonDateKey,
 		snapshotCardCount: cards.length,
 		snapshotTopLimit: POKECA_SNAPSHOT_TOP_LIMIT,
 		imageLimitUsed: resolvedImageLimit,
+		templateImageUsed: Boolean(resolvedTemplateImageUrl),
+		templateImageUrl: resolvedTemplateImageUrl,
+		collageUsed: Boolean(collage),
+		collageReason: collage ? "ok" : (lastPokecaCollageDebugReason ?? null),
+		collageTitle: collageTitle,
+		originalCandidateKey: selectedOriginalCandidate?.key ?? null,
+		originalCandidateLabel: selectedOriginalCandidate?.label ?? null,
 		messageLengthWeighted: countXWeightedLength(message),
 		previewMessage: message,
 		previewImages: imageItems.map((x) => ({ url: x.url, cardName: x.alt })),
@@ -2182,12 +4327,59 @@ function parseBooleanEnv(value: string | undefined, defaultValue: boolean): bool
 	return defaultValue;
 }
 
-function isPriceSpikeAiEnabled(env: MonitorEnv): boolean {
-	return parseBooleanEnv(env.PRICE_SPIKE_USE_AI, false);
-}
-
 function isMarketSummaryAiEnabled(env: MonitorEnv): boolean {
 	return parseBooleanEnv(env.MARKET_SUMMARY_USE_AI, true);
+}
+
+function isPokecaSummaryAiEnabled(env: MonitorEnv): boolean {
+	return parseBooleanEnv(env.POKECA_SUMMARY_USE_AI, true);
+}
+
+function isXAutoLikeEnabled(env: MonitorEnv): boolean {
+	return parseBooleanEnv(env.X_AUTO_LIKE_ENABLED, false);
+}
+
+function resolveXAutoLikeDailyLimit(env: MonitorEnv): number {
+	const parsed = Math.trunc(Number(env.X_AUTO_LIKE_DAILY_LIMIT ?? X_AUTO_LIKE_DEFAULT_DAILY_LIMIT));
+	if (!Number.isFinite(parsed)) return X_AUTO_LIKE_DEFAULT_DAILY_LIMIT;
+	return Math.max(1, Math.min(200, parsed));
+}
+
+function resolveXAutoLikeMaxPerRun(env: MonitorEnv, override: number | null): number {
+	if (override != null && Number.isFinite(Number(override))) {
+		return Math.max(0, Math.min(10, Math.trunc(Number(override))));
+	}
+	const parsed = Math.trunc(Number(env.X_AUTO_LIKE_MAX_PER_RUN ?? X_AUTO_LIKE_DEFAULT_MAX_PER_RUN));
+	if (!Number.isFinite(parsed)) return X_AUTO_LIKE_DEFAULT_MAX_PER_RUN;
+	return Math.max(1, Math.min(10, parsed));
+}
+
+function resolveXAutoLikeQuery(env: MonitorEnv): string {
+	const custom = String(env.X_AUTO_LIKE_QUERY ?? "").trim();
+	if (custom) return custom;
+	return X_AUTO_LIKE_DEFAULT_QUERY;
+}
+
+function isXAutoLikeAiEnabled(env: MonitorEnv): boolean {
+	return parseBooleanEnv(env.X_AUTO_LIKE_AI_ENABLED, false);
+}
+
+function resolveXAutoLikeAiDailyLimit(env: MonitorEnv): number {
+	const parsed = Math.trunc(Number(env.X_AUTO_LIKE_AI_DAILY_LIMIT ?? X_AUTO_LIKE_AI_DEFAULT_DAILY_LIMIT));
+	if (!Number.isFinite(parsed)) return X_AUTO_LIKE_AI_DEFAULT_DAILY_LIMIT;
+	return Math.max(0, Math.min(100, parsed));
+}
+
+function resolveXAutoLikeAiMaxPerRun(env: MonitorEnv): number {
+	const parsed = Math.trunc(Number(env.X_AUTO_LIKE_AI_MAX_PER_RUN ?? X_AUTO_LIKE_AI_DEFAULT_MAX_PER_RUN));
+	if (!Number.isFinite(parsed)) return X_AUTO_LIKE_AI_DEFAULT_MAX_PER_RUN;
+	return Math.max(0, Math.min(10, parsed));
+}
+
+function resolveXAutoLikeAiModel(env: MonitorEnv): string {
+	const custom = String(env.X_AUTO_LIKE_AI_MODEL ?? "").trim();
+	if (custom) return custom;
+	return X_AUTO_LIKE_AI_DEFAULT_MODEL;
 }
 
 function resolveMarketSummaryModel(env: MonitorEnv): string {
@@ -2196,147 +4388,302 @@ function resolveMarketSummaryModel(env: MonitorEnv): string {
 	return DEFAULT_MARKET_SUMMARY_MODEL;
 }
 
-async function generatePriceSpikeMessage(
-	spike: PriceSpikeItem,
+function resolvePokecaSummaryModel(env: MonitorEnv): string {
+	const custom = String(env.POKECA_SUMMARY_MODEL ?? "").trim();
+	if (custom) return custom;
+	return DEFAULT_POKECA_SUMMARY_MODEL;
+}
+
+function normalizePokecaSummaryAiLead(text: string): string {
+	const firstLine = String(text ?? "")
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/https?:\/\/\S+/g, " ")
+		.replace(/#[\p{L}\p{N}_]+/gu, " ")
+		.split(/\n+/)
+		.map((line) => line.trim())
+		.find(Boolean);
+	if (!firstLine) return "";
+	const compact = firstLine.replace(/\s+/g, " ").trim();
+	const cleaned = compact.replace(/^[「『【\[]+|[」』】\]]+$/g, "").trim();
+	return fitToXWeightedLength(cleaned, 52);
+}
+
+function fitToXWeightedLength(text: string, maxLength: number): string {
+	let value = String(text ?? "").trim();
+	while (value && countXWeightedLength(value) > maxLength) {
+		value = value.slice(0, -1).trimEnd();
+	}
+	return value;
+}
+
+function validatePokecaSummaryAiLead(text: string): { ok: boolean; reason?: string } {
+	const value = String(text ?? "").trim();
+	if (!value) return { ok: false, reason: "empty_ai_text" };
+	if (/https?:\/\/\S+/.test(value)) return { ok: false, reason: "ai_contains_url" };
+	if (/#[\p{L}\p{N}_]+/u.test(value)) return { ok: false, reason: "ai_contains_hashtag" };
+	if (countXWeightedLength(value) > 52) return { ok: false, reason: "ai_text_too_long" };
+	return { ok: true };
+}
+
+function normalizePokecaSummaryAiAccent(text: string): string {
+	const firstLine = String(text ?? "")
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/https?:\/\/\S+/g, " ")
+		.split(/\n+/)
+		.map((line) => line.trim())
+		.find(Boolean);
+	if (!firstLine) return "";
+	return firstLine.replace(/\s+/g, " ");
+}
+
+function validatePokecaSummaryAiAccent(text: string): { ok: boolean; reason?: string } {
+	const value = String(text ?? "").trim();
+	if (!value) return { ok: false, reason: "empty_ai_text" };
+	if (/https?:\/\/\S+/.test(value)) return { ok: false, reason: "ai_contains_url" };
+	if (/#[\p{L}\p{N}_]+/u.test(value)) return { ok: false, reason: "ai_contains_hashtag" };
+	if (countXWeightedLength(value) > 34) return { ok: false, reason: "ai_text_too_long" };
+	if (!/[🔥📈📉✨⚡👀🎯💡🚀✅]/u.test(value)) return { ok: false, reason: "ai_missing_emoji" };
+	return { ok: true };
+}
+
+function getDefaultAccentLine(rankTarget: PokecaRankTarget, rankLabel?: string): string {
+	const label = String(rankLabel ?? "").trim();
+	if (label) {
+		if (label.includes("下落")) return "📉 変動幅の大きい銘柄をチェック";
+		if (label.includes("取引") || label.includes("出来高")) return "👀 取引が集まった銘柄に注目";
+		return "📈 値動きの強い銘柄をチェック";
+	}
+	if (rankTarget === "rank_fall_7") return "📉 変動幅の大きい銘柄をチェック";
+	if (rankTarget === "rank_vol") return "👀 取引が集まった銘柄に注目";
+	return "📈 値動きの強い銘柄をチェック";
+}
+
+async function generatePokecaSummaryAiAccent(
 	env: MonitorEnv,
-): Promise<{ ok: boolean; message?: string; reason?: string }> {
-	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
-	const model = env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
-	const period = normalizePriceSpikePeriod(spike.period);
-	const canonicalCardName = getCanonicalPriceSpikeCardName(spike);
-	const sourceSite = normalizePriceSpikeSource(spike.source_site) || "snkrdunk/pokeca-chart";
-	const dateRange = getPriceSpikeDateRangeText(spike);
-	const addTrendLine = isPriceSpikeWithin24Hours(spike);
+	params: {
+		rankLabel: string;
+		rankTarget: PokecaRankTarget;
+		cards: PokecaSummaryCard[];
+	},
+): Promise<{ ok: boolean; line?: string; reason?: string; model?: string | null }> {
+	if (!isPokecaSummaryAiEnabled(env)) return { ok: false, reason: "pokeca_summary_ai_disabled", model: null };
+	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key", model: null };
+	const model = resolvePokecaSummaryModel(env);
+	const topRows = params.cards
+		.slice(0, 3)
+		.map((card, idx) => `${idx + 1}. ${stripPokecaCardVariant(card.cardName)} ${formatNumber(card.price)}円`)
+		.join("\n");
 	const prompt = [
-		"以下の条件でX投稿文を1本作成してください。",
+		"X投稿に入れる短い1行コメントを作成してください。",
+		`種別: ${params.rankLabel} (${params.rankTarget})`,
+		"上位3件:",
+		topRows,
 		"",
-		`カード名（厳密）: ${canonicalCardName}`,
-		`カード識別子: ${spike.card_id ?? "未指定"}`,
-		`前回価格: ${formatNumber(spike.before)}円`,
-		`現在価格: ${formatNumber(spike.after)}円`,
-		`変化率: +${Number(spike.change_pct).toFixed(2)}%`,
-		`比較期間: ${period}`,
-		`表示用日付範囲: ${dateRange}`,
-		`24時間以内フラグ: ${addTrendLine ? "yes" : "no"}`,
-		`取得時刻: ${spike.fetched_at}`,
-		`参照サイト: ${sourceSite}`,
-		"",
-		"【出力ルール】",
-		"- 1行目: `💣価格スパイク速報🔥`",
-		"- 2行目: 空行",
-		"- 3行目: `【カード名】` の形式で書く",
-		"- 4行目: 空行",
-		"- 5行目: 表示用日付範囲",
-		"- 6行目: 空行",
-		"- 7行目: {前回価格}円 → {現在価格}円（+{変化率}%）",
-		"- 8行目: 空行",
-		"- 9行目: 24時間以内フラグがyesの時だけ `24時間以内のトレンドを確認。` を入れる。noの時はこの行を省略",
-		"- 10行目: 空行（9行目を省略した時は不要）",
-		"- 11行目: #ポケカ",
-		"- URLは一切含めない（市場情報のみ）",
-		"- ハッシュタグは #ポケカ 固定（1つのみ）",
-		"- できるだけ改行を多くして読みやすくする",
-		"- 文字数は60〜120文字",
-		"- 禁止: 『急げ』『爆アツ』『絶対』などの断定・煽り",
-		"- 根拠のない価格予測・断定は禁止",
-		"- 行構成を崩さない",
+		"制約:",
+		"- 1行のみ",
+		"- 12〜30文字",
+		"- 絵文字を1〜3個入れる",
+		"- URL/ハッシュタグ禁止",
+		"- 煽り・断定・予想は禁止",
 	].join("\n");
 	const response = await callAnthropicTextGeneration({
-		system: PRICE_SPIKE_SYSTEM_PROMPT,
+		system: "短い市場コメントを作る編集者。出力は本文1行のみ。",
 		prompt,
 		apiKey: env.ANTHROPIC_API_KEY,
 		model,
 	});
-	if (!response.ok || !response.text) return { ok: false, reason: response.reason ?? "anthropic_failed" };
-	const normalized = normalizePriceSpikeMessage(response.text);
-	const validation = validatePriceSpikeMessage(normalized, period);
-	if (!validation.ok) return { ok: false, reason: validation.reasons.join(" / ") };
-	return { ok: true, message: normalized };
+	if (!response.ok || !response.text) {
+		return { ok: false, reason: response.reason ?? "anthropic_failed", model };
+	}
+	const normalized = normalizePokecaSummaryAiAccent(response.text);
+	const validation = validatePokecaSummaryAiAccent(normalized);
+	if (!validation.ok) {
+		return { ok: false, reason: validation.reason ?? "invalid_ai_text", model };
+	}
+	return { ok: true, line: normalized, model };
 }
 
-function normalizePriceSpikeMessage(text: string): string {
-	const withoutFence = text.replace(/```[\s\S]*?```/g, " ").trim();
-	const noUrl = withoutFence.replace(/https?:\/\/\S+/g, "").trim();
-	const lines = noUrl
-		.split(/\n+/)
-		.map((line) => line.replace(/#[\p{L}\p{N}_]+/gu, "").replace(/\s+/g, " ").trim())
-		.filter(Boolean);
-	const title = "💣価格スパイク速報🔥";
-	const card = lines.find((line) => /^【.+】$/.test(line)) ?? "";
-	const dateRange = lines.find((line) => /^\d{1,2}\/\d{1,2}〜\d{1,2}\/\d{1,2}$/.test(line)) ?? "";
-	const price = lines.find((line) => /円\s*→\s*[0-9,]+円（[+\-][0-9]+(?:\.[0-9]+)?%）/.test(line)) ?? "";
-	const trend = lines.find((line) => /24時間以内のトレンドを確認。/.test(line)) ?? "";
-	const out = [title, "", card, "", dateRange, "", price];
-	if (trend) out.push("", trend);
-	out.push("", "#ポケカ");
-	return out.join("\n").trim();
+function applyPokecaSummaryAccentLine(message: string, accentLine: string): string {
+	const line = String(accentLine ?? "").trim();
+	if (!line) return message;
+	const rows = String(message ?? "").split("\n");
+	let insertAt = rows.findIndex((row) => /^\d{1,2}\/\d{1,2}（/.test(String(row).trim()));
+	if (insertAt < 0) insertAt = 0;
+	const next = [...rows.slice(0, insertAt + 1), line, ...rows.slice(insertAt + 1)].join("\n");
+	return countXWeightedLength(next) <= POKECA_TWEET_TEXT_LIMIT ? next : message;
 }
 
-function validatePriceSpikeMessage(
+function normalizePokecaSummaryAiMessage(text: string): string {
+	return String(text ?? "")
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/\r\n/g, "\n")
+		.split("\n")
+		.map((line) => line.replace(/\s+$/g, ""))
+		.join("\n")
+		.trim();
+}
+
+function validatePokecaSummaryAiMessage(
 	text: string,
-	period: string,
-): { ok: boolean; reasons: string[] } {
-	const reasons: string[] = [];
-	const length = countXLength(text);
-	if (length < 60) reasons.push(`文字数不足(${length})`);
-	if (length > 120) reasons.push(`文字数超過(${length})`);
-	if (!/#ポケカ/u.test(text)) reasons.push("#ポケカがありません");
-	if ((text.match(/#[\p{L}\p{N}_]+/gu) ?? []).length !== 1) reasons.push("ハッシュタグは #ポケカ のみ");
-	if (/急げ|爆アツ|今すぐ|絶対|確実|上がる|まだ伸びる/.test(text)) reasons.push("禁止表現を検出");
-	if (/正直|個人的/.test(text)) reasons.push("主観表現を検出");
-	if (!/価格スパイク速報/.test(text)) reasons.push("タイトル行が不足しています");
-	if (!/^【.+】$/m.test(text)) reasons.push("カード名行が不足しています");
-	if (!/\d{1,2}\/\d{1,2}〜\d{1,2}\/\d{1,2}/.test(text)) reasons.push("日付範囲行が不足しています");
-	if (!/円\s*→\s*[0-9,]+円（[+\-][0-9]+(?:\.[0-9]+)?%）/.test(text)) {
-		reasons.push("価格表記形式が不正です");
+	params: {
+		cardLines: string[];
+		collectedLine: string;
+	},
+): { ok: boolean; reason?: string } {
+	if (!text) return { ok: false, reason: "empty_ai_text" };
+	if (countXWeightedLength(text) > POKECA_TWEET_TEXT_LIMIT) return { ok: false, reason: "ai_text_too_long" };
+	if (/https?:\/\/\S+/u.test(text)) return { ok: false, reason: "ai_contains_url" };
+	const hashtags = text.match(/#[\p{L}\p{N}_]+/gu) ?? [];
+	if (hashtags.length !== 1 || hashtags[0] !== "#ポケカ") {
+		return { ok: false, reason: "ai_hashtag_policy_violation" };
 	}
-	const lineCount = text.split(/\n/).filter(Boolean).length;
-	if (lineCount < 3) reasons.push("行数が不足しています（最低3行）");
-	if (/https?:\/\/\S+/.test(text)) reasons.push("URLは含めないでください");
-	return { ok: reasons.length === 0, reasons };
-}
-
-function buildPriceSpikeFallbackMessage(spike: PriceSpikeItem): string {
-	const cardName = getCanonicalPriceSpikeCardName(spike);
-	const pct = Number(spike.change_pct);
-	const sign = pct >= 0 ? "+" : "-";
-	const dateRange = getPriceSpikeDateRangeText(spike);
-	const includeTrendLine = isPriceSpikeWithin24Hours(spike);
-	const lines = [
-		"💣価格スパイク速報🔥",
-		"",
-		`【${cardName}】`,
-		"",
-		dateRange,
-		"",
-		`${formatNumber(spike.before)}円 → ${formatNumber(spike.after)}円（${sign}${Math.abs(pct).toFixed(2)}%）`,
-		"",
-	];
-	if (includeTrendLine) {
-		lines.push("24時間以内のトレンドを確認。", "");
+	if (!text.includes(`#ポケカ`)) return { ok: false, reason: "ai_missing_hashtag" };
+	if (/TOP\d+/u.test(text)) return { ok: false, reason: "ai_contains_top_header" };
+	if (!text.includes(params.collectedLine)) return { ok: false, reason: "ai_missing_collected_line" };
+	for (const line of params.cardLines) {
+		if (!text.includes(line)) return { ok: false, reason: "ai_missing_card_line" };
 	}
-	lines.push("#ポケカ");
-	return lines.join("\n");
+	const lines = text
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean);
+	const fixedLineSet = new Set<string>([
+		...params.cardLines,
+		"#ポケカ",
+	]);
+	const hasFreeLine = lines.some((line) => !fixedLineSet.has(line));
+	if (!hasFreeLine) return { ok: false, reason: "ai_missing_free_comment_line" };
+	return { ok: true };
 }
 
-function buildPriceSpikeImageAlt(spike: PriceSpikeItem): string {
-	const cardName = getCanonicalPriceSpikeCardName(spike);
-	const pct = Number(spike.change_pct);
-	const sign = pct >= 0 ? "+" : "-";
-	return `${cardName} | ${formatNumber(spike.after)}円（前回比${sign}${Math.abs(pct).toFixed(0)}%）`;
+async function generatePokecaSummaryAiMessage(
+	env: MonitorEnv,
+	params: {
+		rankLabel: string;
+		rankTarget: PokecaRankTarget;
+		cards: PokecaSummaryCard[];
+		now: Date;
+		consecutiveLine: string | null;
+	},
+): Promise<{ ok: boolean; message?: string; displayedCount?: number; reason?: string; model?: string }> {
+	if (!isPokecaSummaryAiEnabled(env)) return { ok: false, reason: "pokeca_summary_ai_disabled" };
+	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
+	const model = resolvePokecaSummaryModel(env);
+	const rankCountCandidates = [POKECA_POST_RANK_LIMIT, 8, 5, 4, 3].filter(
+		(n) => n > 0 && params.cards.length >= n,
+	);
+	const rankWindow = getPokecaRankWindowLabel(params.rankTarget);
+	const dateLabel = formatJstDateLabel(params.now);
+	const collectedLine = `${dateLabel}（${rankWindow}）`;
+	const consecutiveLine = String(params.consecutiveLine ?? "").trim() || null;
+	let lastReason = "ai_generation_failed";
+
+	for (const rankCount of rankCountCandidates) {
+		const selectedCards = params.cards.slice(0, rankCount);
+		const cardLines = selectedCards.map((card, idx) => buildPokecaSummaryRankLine(card, idx, params.rankTarget));
+		const fixedLines = [collectedLine, ...cardLines, "#ポケカ"].join("\n");
+		const prompt = [
+			"以下の固定情報を使って、X投稿文を1本作成してください。",
+			"",
+			`ランキング種別: ${params.rankLabel}`,
+			`内部キー: ${params.rankTarget}`,
+			"",
+			"必須ルール:",
+			"- 出力は投稿本文のみ",
+			"- URLを含めない",
+			"- ハッシュタグは #ポケカ のみ",
+			"- 断定予測・煽り禁止",
+			"- 文字数は280以内",
+			"- 下のカード行は『1文字も変更せず』同順序で全行を含める",
+			"- `【...TOPN】` の見出しは使わない",
+			"- 冒頭1行はタイトル風にし、絵文字を1〜3個入れてにぎやかにする",
+			"- カード行以外に、読み手向けの自由コメント行を1行以上入れる",
+			"- 文字数が厳しい場合は、日付行や連続ランクイン行を省略してよい",
+			"",
+			`補足候補（日付）: ${collectedLine}`,
+			`補足候補（連続ランクイン）: ${consecutiveLine ?? "なし"}`,
+			"",
+			"この行は必ず含めてください:",
+			fixedLines,
+		].join("\n");
+		const response = await callAnthropicTextGeneration({
+			system:
+				"あなたはTCGSTOREのX運用担当。事実データを崩さず、読みやすい市場まとめ投稿を作る編集者。",
+			prompt,
+			apiKey: env.ANTHROPIC_API_KEY,
+			model,
+		});
+		if (!response.ok || !response.text) {
+			lastReason = response.reason ?? "anthropic_failed";
+			continue;
+		}
+		const normalized = normalizePokecaSummaryAiMessage(response.text);
+		const validation = validatePokecaSummaryAiMessage(normalized, {
+			cardLines,
+			collectedLine,
+		});
+		if (!validation.ok) {
+			lastReason = validation.reason ?? "invalid_ai_text";
+			continue;
+		}
+		return { ok: true, message: normalized, displayedCount: rankCount, model };
+	}
+	return { ok: false, reason: lastReason, model };
 }
 
-function getPriceSpikeDateRangeText(spike: PriceSpikeItem): string {
-	const endIso = String(spike.fetched_at ?? "").trim();
-	const startIso = String(spike.previous_fetched_at ?? "").trim() || endIso;
-	return `${formatJstMonthDay(startIso)}〜${formatJstMonthDay(endIso)}`;
-}
-
-function isPriceSpikeWithin24Hours(spike: PriceSpikeItem): boolean {
-	const end = new Date(String(spike.fetched_at ?? ""));
-	const start = new Date(String(spike.previous_fetched_at ?? ""));
-	if (!Number.isFinite(end.getTime()) || !Number.isFinite(start.getTime())) return false;
-	return end.getTime() - start.getTime() <= 24 * 60 * 60 * 1000 && end.getTime() >= start.getTime();
+async function generatePokecaSummaryAiLead(
+	env: MonitorEnv,
+	params: {
+		rankLabel: string;
+		rankTarget: PokecaRankTarget;
+		topCards: PokecaSummaryCard[];
+		consecutiveCount: number;
+	},
+): Promise<{ ok: boolean; lead?: string; reason?: string; model?: string }> {
+	if (!isPokecaSummaryAiEnabled(env)) return { ok: false, reason: "pokeca_summary_ai_disabled" };
+	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
+	const model = resolvePokecaSummaryModel(env);
+	const topRows = params.topCards
+		.slice(0, 3)
+		.map(
+			(card, idx) =>
+				`${idx + 1}. ${card.cardName} ${formatNumber(card.price)}円` +
+				`${buildPokecaChangeText(card) ? `（${buildPokecaChangeText(card)}）` : ""}`,
+		)
+		.join("\n");
+	const prompt = [
+		"次のランキング投稿に添える「ひとこと」を1行だけ作成してください。",
+		"",
+		`ランキング種別: ${params.rankLabel}`,
+		`内部キー: ${params.rankTarget}`,
+		`2日連続ランクイン件数(TOP10): ${params.consecutiveCount}`,
+		"上位3件:",
+		topRows,
+		"",
+		"出力ルール:",
+		"- 1行のみ",
+		"- 20〜42文字程度",
+		"- 日本語",
+		"- URL/ハッシュタグ禁止",
+		"- 断定予測・煽りは禁止",
+		"- 「観測メモ」「集計」「スクレイピング」という語は禁止",
+	].join("\n");
+	const response = await callAnthropicTextGeneration({
+		system:
+			"あなたはTCGSTOREのX運用担当。データ投稿の前置きとなる自然な1行コメントを、簡潔かつ事実ベースで作成する。",
+		prompt,
+		apiKey: env.ANTHROPIC_API_KEY,
+		model,
+	});
+	if (!response.ok || !response.text) {
+		return { ok: false, reason: response.reason ?? "anthropic_failed", model };
+	}
+	const normalized = normalizePokecaSummaryAiLead(response.text);
+	const validation = validatePokecaSummaryAiLead(normalized);
+	if (!validation.ok) {
+		return { ok: false, reason: validation.reason ?? "invalid_ai_text", model };
+	}
+	return { ok: true, lead: normalized, model };
 }
 
 function normalizePriceSpikePeriod(period?: string): string {
@@ -2363,88 +4710,6 @@ function normalizePriceSpikeSource(source: string | undefined): "snkrdunk" | "po
 	if (lower.includes("snkrdunk")) return "snkrdunk";
 	if (lower.includes("pokeca-chart") || lower.includes("pokecachart")) return "pokeca-chart";
 	return null;
-}
-
-function hasCardVariantIdentifier(value: string): boolean {
-	const text = String(value ?? "");
-	return /[A-Za-z]{1,4}\d{1,4}|[0-9]{2,3}\/[0-9]{2,3}|sv\d+[a-z]?|s\d[a-z]\d/i.test(text);
-}
-
-function validatePriceSpikeInput(
-	spike: PriceSpikeItem,
-	payloadSource: string | undefined,
-): { ok: boolean; reason?: string } {
-	const canonicalName = getCanonicalPriceSpikeCardName(spike);
-	if (!canonicalName) return { ok: false, reason: "missing_card_name" };
-	if (!Number.isFinite(spike.before) || !Number.isFinite(spike.after) || spike.before <= 0 || spike.after <= 0) {
-		return { ok: false, reason: "invalid_price_values" };
-	}
-	const source = normalizePriceSpikeSource(spike.source_site ?? payloadSource);
-	if (!source) {
-		return { ok: false, reason: "unsupported_source_site" };
-	}
-	if (source !== "pokeca-chart") {
-		return { ok: false, reason: "price_spike_source_disabled" };
-	}
-	if (!isValidPriceSpikeSourceUrl(spike.source_url, source)) {
-		return { ok: false, reason: "invalid_or_missing_source_url" };
-	}
-	const cardId = String(spike.card_id ?? "").trim();
-	if (!cardId && !hasCardVariantIdentifier(canonicalName)) {
-		return { ok: false, reason: "ambiguous_card_variant" };
-	}
-	return { ok: true };
-}
-
-async function enrichPriceSpikeIdentity(
-	spike: PriceSpikeItem | undefined,
-	payloadSource: string | undefined,
-): Promise<PriceSpikeItem> {
-	const base = { ...(spike ?? ({} as PriceSpikeItem)) };
-	base.image_url = undefined;
-	base.imageUrl = null;
-	const source = normalizePriceSpikeSource(base.source_site ?? payloadSource);
-	if (!source) return base;
-	if (String(base.source_site ?? "").trim() === "") {
-		base.source_site = source;
-	}
-	if (!isValidPriceSpikeSourceUrl(base.source_url, source)) return base;
-	try {
-		const page = await fetchPriceSpikeSourcePage(base.source_url!);
-		const pageOrigin = new URL(page.finalUrl || base.source_url!).origin;
-		const ogImage = extractOgImageUrl(page.html, pageOrigin);
-		const marketImage = normalizeWatchImageUrl(ogImage, source);
-		if (marketImage) {
-			base.image_url = marketImage;
-			base.imageUrl = marketImage;
-		}
-		if (source === "pokeca-chart") {
-			base.history_prices = extractPriceHistoryFromPokecaChartHtml(page.html);
-		}
-		const hasStrongIdentity =
-			String(base.card_id ?? "").trim().length > 0 ||
-			hasCardVariantIdentifier(getCanonicalPriceSpikeCardName(base));
-		if (hasStrongIdentity) return base;
-		const title = extractSourceTitle(page.html);
-		const titleWithId = title && hasCardVariantIdentifier(title) ? title : null;
-		if (titleWithId && titleWithId.includes(String(base.card ?? "").trim())) {
-			base.variant = titleWithId;
-		}
-		const idFromText =
-			extractCardIdentifierNearCardName(page.html, String(base.card ?? "").trim()) ||
-			(String(base.card ?? "").trim() && title?.includes(String(base.card ?? "").trim())
-				? extractCardIdentifierFromText(title ?? "")
-				: null);
-		if (!base.card_id && idFromText) {
-			base.card_id = idFromText;
-		}
-		if (!base.variant && idFromText) {
-			base.variant = `${String(base.card ?? "").trim()} ${idFromText}`.trim();
-		}
-	} catch {
-		// keep original input and let validation decide
-	}
-	return base;
 }
 
 async function fetchPriceSpikeSourcePage(
@@ -2474,92 +4739,6 @@ function extractSourceTitle(html: string): string | null {
 	const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
 	if (!titleMatch?.[1]) return null;
 	return decodeHtmlEntities(stripTags(titleMatch[1])).replace(/\s+/g, " ").trim();
-}
-
-function extractPriceHistoryFromPokecaChartHtml(html: string): Array<{ date: string; price: number }> {
-	const out = new Map<string, number>();
-	const pairRegex = /"date"\s*:\s*"(\d{4}-\d{2}-\d{2})"[\s\S]{0,80}?"(?:price|value|avg|median)"\s*:\s*([0-9]{2,8})/g;
-	let m: RegExpExecArray | null;
-	while ((m = pairRegex.exec(html)) !== null) {
-		const date = m[1];
-		const price = Number(m[2]);
-		if (!Number.isFinite(price) || price <= 0) continue;
-		out.set(date, price);
-	}
-	const tupleRegex = /\[\s*"(\d{4}-\d{2}-\d{2})"\s*,\s*([0-9]{2,8})\s*\]/g;
-	while ((m = tupleRegex.exec(html)) !== null) {
-		const date = m[1];
-		const price = Number(m[2]);
-		if (!Number.isFinite(price) || price <= 0) continue;
-		if (!out.has(date)) out.set(date, price);
-	}
-	return [...out.entries()]
-		.map(([date, price]) => ({ date, price }))
-		.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
-		.slice(-180);
-}
-
-function extractCardIdentifierFromText(text: string): string | null {
-	return extractCardIdentifierCandidatesFromText(text)[0] ?? null;
-}
-
-function extractCardIdentifierCandidatesFromText(text: string): string[] {
-	const candidates = new Set<string>();
-	const patterns = [
-		/\bsv\d+[a-z]?\s*[\-_/]?\s*\d{1,3}\/\d{1,3}\b/i,
-		/\b(?:sm|s|xy|bw|cp|dp|pcg)[a-z0-9\-]*\s*[\-_/]?\s*\d{1,3}\/\d{1,3}\b/i,
-		/\b\d{1,3}\/\d{1,3}\b/,
-	];
-	for (const pattern of patterns) {
-		const matches = text.matchAll(new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`));
-		for (const match of matches) {
-			if (!match?.[0]) continue;
-			candidates.add(match[0].replace(/\s+/g, "").toUpperCase());
-		}
-	}
-	return [...candidates];
-}
-
-function extractCardIdentifierNearCardName(html: string, cardName: string): string | null {
-	const target = String(cardName ?? "").trim();
-	if (!target) return null;
-	const plain = stripTags(html).replace(/\s+/g, " ");
-	const escaped = escapeRegExp(target);
-	const nameRegex = new RegExp(escaped, "ig");
-	const candidates = new Set<string>();
-	let match: RegExpExecArray | null;
-	while ((match = nameRegex.exec(plain)) !== null) {
-		const start = Math.max(0, match.index - 90);
-		const end = Math.min(plain.length, match.index + match[0].length + 90);
-		const windowText = plain.slice(start, end);
-		for (const id of extractCardIdentifierCandidatesFromText(windowText)) {
-			candidates.add(id);
-		}
-	}
-	if (candidates.size === 1) return [...candidates][0];
-	return null;
-}
-
-function isValidPriceSpikeSourceUrl(
-	sourceUrl: string | undefined,
-	source: "snkrdunk" | "pokeca-chart",
-): boolean {
-	if (!sourceUrl) return false;
-	let parsed: URL;
-	try {
-		parsed = new URL(sourceUrl);
-	} catch {
-		return false;
-	}
-	const host = parsed.hostname.toLowerCase();
-	if (source === "snkrdunk") {
-		return host === "snkrdunk.com" || host.endsWith(".snkrdunk.com");
-	}
-	return host === "pokeca-chart.com" || host.endsWith(".pokeca-chart.com");
-}
-
-function escapeRegExp(text: string): string {
-	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function pickDailySpotlightSource(seed: number): "tcgstore" | "mercari" {
@@ -3713,11 +5892,12 @@ async function runMonitor(
 				level: "under_1",
 				includeLastPrize: Boolean(detail.lastOneImageUrl),
 				topPrizeNames: detail.topPrizeNames,
+				lastOnePrizeName: detail.lastOnePrizeName,
 				marketContext: matchedMarketContext,
 			});
 
 			if (commit) {
-				const imageAlt = buildThresholdAlertImageAlt(title, detail.topPrizeNames);
+				const imageAlt = buildThresholdAlertImageAlt(title, detail.lastOnePrizeName);
 				const postResult = await postTweetWithImages(
 					previewMessage,
 					{
@@ -3747,11 +5927,12 @@ async function runMonitor(
 				level: "under_5",
 				includeLastPrize: Boolean(detail.lastOneImageUrl),
 				topPrizeNames: detail.topPrizeNames,
+				lastOnePrizeName: detail.lastOnePrizeName,
 				marketContext: matchedMarketContext,
 			});
 
 			if (commit) {
-				const imageAlt = buildThresholdAlertImageAlt(title, detail.topPrizeNames);
+				const imageAlt = buildThresholdAlertImageAlt(title, detail.lastOnePrizeName);
 				const postResult = await postTweetWithImages(
 					previewMessage,
 					{
@@ -3856,42 +6037,6 @@ function createStateStore(env: Partial<MonitorEnv>): StateStore {
 	};
 }
 
-type PriceSpikeAuditEntry = {
-	at: string;
-	source: string | null;
-	card: string | null;
-	commit: boolean;
-	ok: boolean;
-	skipped: boolean;
-	postedToX: boolean;
-	reason: string | null;
-	xStatus: number | null;
-};
-
-async function getPriceSpikeAudit(stateStore: StateStore, limit = 30): Promise<PriceSpikeAuditEntry[]> {
-	const raw = await stateStore.get(PRICE_SPIKE_AUDIT_KEY);
-	if (!raw) return [];
-	try {
-		const parsed = JSON.parse(raw) as unknown;
-		if (!Array.isArray(parsed)) return [];
-		return parsed
-			.filter((row): row is PriceSpikeAuditEntry => Boolean(row) && typeof row === "object")
-			.slice(0, Math.max(1, Math.min(PRICE_SPIKE_AUDIT_LIMIT, limit)));
-	} catch {
-		return [];
-	}
-}
-
-async function appendPriceSpikeAudit(stateStore: StateStore, row: PriceSpikeAuditEntry): Promise<void> {
-	try {
-		const current = await getPriceSpikeAudit(stateStore, PRICE_SPIKE_AUDIT_LIMIT);
-		const next = [row, ...current].slice(0, PRICE_SPIKE_AUDIT_LIMIT);
-		await stateStore.put(PRICE_SPIKE_AUDIT_KEY, JSON.stringify(next));
-	} catch {
-		// best-effort diagnostics only
-	}
-}
-
 function buildAlertMessage({
 	source,
 	title,
@@ -3901,6 +6046,7 @@ function buildAlertMessage({
 	level,
 	includeLastPrize,
 	topPrizeNames,
+	lastOnePrizeName,
 	marketContext,
 }: {
 	source: MonitorSource;
@@ -3911,6 +6057,7 @@ function buildAlertMessage({
 	level: AlertLevel;
 	includeLastPrize: boolean;
 	topPrizeNames: string[];
+	lastOnePrizeName: string | null;
 	marketContext: LatestMarketContext | null;
 }): string {
 	if (source === "mercari") {
@@ -3922,6 +6069,7 @@ function buildAlertMessage({
 			level,
 			includeLastPrize,
 			topPrizeNames,
+			lastOnePrizeName,
 			marketContext,
 		});
 	}
@@ -3941,7 +6089,11 @@ function buildAlertMessage({
 
 	lines.push("", `残り${safeRemaining}回（全${safeTotal}回）`, "");
 	if (includeLastPrize) {
-		lines.push(`${hotIcon} ${lastPrizeLabel}を狙え`, "");
+		const safeLastPrizeName = sanitizeCardNameForPost(lastOnePrizeName ?? "").slice(0, 28).trim();
+		const targetLine = safeLastPrizeName
+			? `${hotIcon} ${lastPrizeLabel}「${safeLastPrizeName}」を狙え`
+			: `${hotIcon} ${lastPrizeLabel}を狙え`;
+		lines.push(targetLine, "");
 	}
 	const marketLine = buildAlertMarketLine(marketContext);
 	if (marketLine) {
@@ -3960,6 +6112,7 @@ function buildMercariAlertMessage({
 	level,
 	includeLastPrize,
 	topPrizeNames,
+	lastOnePrizeName,
 	marketContext,
 }: {
 	title: string;
@@ -3969,6 +6122,7 @@ function buildMercariAlertMessage({
 	level: AlertLevel;
 	includeLastPrize: boolean;
 	topPrizeNames: string[];
+	lastOnePrizeName: string | null;
 	marketContext: LatestMarketContext | null;
 }): string {
 	const safeRemaining = Number.isFinite(remaining) ? formatNumber(remaining as number) : "?";
@@ -3987,7 +6141,7 @@ function buildMercariAlertMessage({
 		"",
 	];
 	if (includeLastPrize) {
-		const lastPrizeName = sanitizeCardNameForPost(topPrizeNames[0] ?? "").slice(0, 28).trim();
+		const lastPrizeName = sanitizeCardNameForPost(lastOnePrizeName ?? "").slice(0, 28).trim();
 		const targetLine = lastPrizeName
 			? `🏆 ラスイチ賞「${lastPrizeName}」を狙え`
 			: "🏆 ラスイチ賞を狙え";
@@ -4033,6 +6187,7 @@ async function postTweetWithImages(
 		lastOneImageAlt?: string | null;
 		additionalImageUrls?: string[];
 		additionalImageAlts?: (string | null)[];
+		inlineImages?: Array<{ blob: Blob; altText?: string | null }>;
 	} = {},
 ): Promise<Record<string, unknown> & { ok: boolean }> {
 	const endpoint = "https://api.x.com/2/tweets";
@@ -4056,24 +6211,40 @@ async function postTweetWithImages(
 
 	const additionalUrls = options.additionalImageUrls ?? [];
 	const additionalAlts = options.additionalImageAlts ?? [];
-	const imageCandidates: Array<{ url: string; altText: string | null }> = [
+	const inlineImages = options.inlineImages ?? [];
+	const imageCandidates: Array<
+		| { kind: "url"; url: string; altText: string | null }
+		| { kind: "blob"; blob: Blob; altText: string | null }
+	> = [
 		{ url: images.mainImageUrl || "", altText: options.mainImageAlt ?? null },
 		{ url: images.lastOneImageUrl || "", altText: options.lastOneImageAlt ?? null },
 		...additionalUrls.map((url, i) => ({
 			url: String(url ?? ""),
 			altText: additionalAlts[i] ?? null,
 		})),
-	].filter((x) => Boolean(x.url));
+	]
+		.filter((x) => Boolean(x.url))
+		.map((x) => ({ kind: "url" as const, ...x }));
+	for (const item of inlineImages) {
+		if (!(item?.blob instanceof Blob)) continue;
+		imageCandidates.push({ kind: "blob", blob: item.blob, altText: item.altText ?? null });
+	}
 
 	const seenImageUrl = new Set<string>();
 	for (const candidate of imageCandidates) {
-		if (seenImageUrl.has(candidate.url)) continue;
-		seenImageUrl.add(candidate.url);
-		const imageUrl = candidate.url;
-		const uploadResult = await uploadImageToX(imageUrl, env);
+		let uploadResult: Record<string, unknown> & { ok: boolean; status: number; mediaId?: string };
+		let sourceLabel = "inline_image";
+		if (candidate.kind === "url") {
+			if (seenImageUrl.has(candidate.url)) continue;
+			seenImageUrl.add(candidate.url);
+			sourceLabel = candidate.url;
+			uploadResult = await uploadImageToX(candidate.url, env);
+		} else {
+			uploadResult = await uploadImageBlobToX(candidate.blob, env);
+		}
 
 		uploadedMedia.push({
-			sourceUrl: imageUrl,
+			sourceUrl: sourceLabel,
 			...uploadResult,
 		});
 
@@ -4092,7 +6263,7 @@ async function postTweetWithImages(
 				const normalizedAltText = candidate.altText.trim();
 				const altResult = await setXMediaAltText(mediaId, normalizedAltText, env);
 				uploadedMedia.push({
-					sourceUrl: imageUrl,
+					sourceUrl: sourceLabel,
 					type: "alt_text",
 					altText: normalizedAltText,
 					...altResult,
@@ -4182,6 +6353,640 @@ async function postTweetWithImages(
 		data,
 		mediaIds,
 		uploadedMedia,
+	};
+}
+
+async function getXAuthenticatedAccount(
+	env: MonitorEnv,
+): Promise<Record<string, unknown> & { ok: boolean; status: number }> {
+	if (!env.X_API_KEY || !env.X_API_KEY_SECRET || !env.X_ACCESS_TOKEN || !env.X_ACCESS_TOKEN_SECRET) {
+		return { ok: false, status: 0, error: "Missing X secrets" };
+	}
+	const endpoint = "https://api.x.com/2/users/me?user.fields=id,name,username,verified";
+	const authorization = await buildOAuth1Header({
+		method: "GET",
+		url: endpoint,
+		consumerKey: env.X_API_KEY,
+		consumerSecret: env.X_API_KEY_SECRET,
+		token: env.X_ACCESS_TOKEN,
+		tokenSecret: env.X_ACCESS_TOKEN_SECRET,
+	});
+	const res = await fetch(endpoint, {
+		method: "GET",
+		headers: { Authorization: authorization },
+	});
+	const raw = await res.text();
+	let data: unknown = null;
+	try {
+		data = JSON.parse(raw);
+	} catch {
+		data = { raw };
+	}
+	return {
+		ok: res.ok,
+		status: res.status,
+		data,
+	};
+}
+
+async function runXAutoLike(
+	env: MonitorEnv,
+	options: XAutoLikeOptions = {},
+): Promise<Record<string, unknown>> {
+	const { commit = false, logToConsole = true, fromSchedule = false, maxLikesPerRun = null } = options;
+	const enabled = isXAutoLikeEnabled(env);
+	if (fromSchedule && !enabled) {
+		const result = {
+			ok: false,
+			reason: "x_auto_like_disabled",
+			fromSchedule,
+			commitMode: commit,
+			enabled,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "X_AUTO_LIKE_SKIP", ...result }, null, 2));
+		return result;
+	}
+	if (!env.X_API_KEY || !env.X_API_KEY_SECRET || !env.X_ACCESS_TOKEN || !env.X_ACCESS_TOKEN_SECRET) {
+		const result = {
+			ok: false,
+			reason: "missing_x_credentials",
+			fromSchedule,
+			commitMode: commit,
+			enabled,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "X_AUTO_LIKE_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const account = await getXAuthenticatedAccount(env);
+	const accountData = (account.data as { data?: { id?: string; username?: string } } | null)?.data ?? null;
+	const accountId = String(accountData?.id ?? "").trim();
+	const accountUsername = String(accountData?.username ?? "").trim();
+	if (!account.ok || !accountId) {
+		const result = {
+			ok: false,
+			reason: "x_account_unavailable",
+			fromSchedule,
+			commitMode: commit,
+			enabled,
+			status: account.status,
+			account,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "X_AUTO_LIKE_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const stateStore = createStateStore(env);
+	const dateKey = getJstYmd(new Date());
+	const stateKey = `${X_AUTO_LIKE_STATE_PREFIX}${dateKey}`;
+	const state = await loadXAutoLikeState(stateStore, stateKey, dateKey);
+	const dailyLimit = resolveXAutoLikeDailyLimit(env);
+	const remainingToday = Math.max(0, dailyLimit - state.count);
+	const maxPerRunResolved = resolveXAutoLikeMaxPerRun(env, maxLikesPerRun);
+	const desiredLikes = Math.min(remainingToday, maxPerRunResolved);
+	if (desiredLikes <= 0) {
+		const result = {
+			ok: true,
+			reason: "daily_limit_reached",
+			fromSchedule,
+			commitMode: commit,
+			enabled,
+			dateKey,
+			dailyLimit,
+			likedToday: state.count,
+			remainingToday,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "X_AUTO_LIKE_RESULT", ...result }, null, 2));
+		return result;
+	}
+
+	const query = resolveXAutoLikeQuery(env);
+	const search = await searchXRecentTweets(query, env);
+	if (!search.ok) {
+		const result = {
+			ok: false,
+			reason: "x_search_failed",
+			fromSchedule,
+			commitMode: commit,
+			enabled,
+			query,
+			status: search.status,
+			error: search.error ?? null,
+			response: search.data,
+		};
+		if (logToConsole) console.log(JSON.stringify({ type: "X_AUTO_LIKE_SKIP", ...result }, null, 2));
+		return result;
+	}
+
+	const existingLikedIds = new Set(state.likedIds);
+	const existingLikedAuthorIds = new Set(state.likedAuthorIds);
+	const inspectedTweets = search.tweets
+		.map((tweet) => {
+			const text = String(tweet.text ?? "");
+			const sentiment = evaluateXAutoLikeSentiment(text);
+			const commercial = evaluateXAutoLikeCommercial(text, tweet.authorUsername);
+			const authorRisk = evaluateXAutoLikeAuthorRisk({
+				authorUsername: tweet.authorUsername,
+				authorDescription: tweet.authorDescription,
+				authorCreatedAt: tweet.authorCreatedAt,
+			});
+			const isSelf = !tweet.authorId || tweet.authorId === accountId;
+			const isDuplicate = existingLikedIds.has(tweet.id);
+			const alreadyLikedAuthorToday = existingLikedAuthorIds.has(tweet.authorId);
+			return {
+				tweetId: tweet.id,
+				authorId: tweet.authorId ?? "",
+				authorUsername: tweet.authorUsername ?? null,
+				text,
+				createdAt: tweet.createdAt ?? null,
+				authorCreatedAt: tweet.authorCreatedAt ?? null,
+				authorDescription: tweet.authorDescription ?? null,
+				sentiment,
+				commercial,
+				authorRisk,
+				isSelf,
+				isDuplicate,
+				alreadyLikedAuthorToday,
+			};
+		})
+		.filter((tweet) => {
+			if (!tweet.tweetId) return false;
+			if (tweet.isSelf) return false;
+			if (tweet.isDuplicate) return false;
+			if (tweet.alreadyLikedAuthorToday) return false;
+			if (tweet.authorRisk.isRejected) return false;
+			return true;
+		});
+
+	const aiEnabled = isXAutoLikeAiEnabled(env) && Boolean(env.ANTHROPIC_API_KEY);
+	const aiDailyLimit = resolveXAutoLikeAiDailyLimit(env);
+	const aiRemainingToday = Math.max(0, aiDailyLimit - state.aiChecks);
+	const aiMaxPerRun = resolveXAutoLikeAiMaxPerRun(env);
+	const aiBudgetForRun = Math.min(aiRemainingToday, aiMaxPerRun);
+	const aiModel = resolveXAutoLikeAiModel(env);
+
+	const ruleCandidates = inspectedTweets.filter(
+		(tweet) =>
+			tweet.sentiment.ok &&
+			tweet.commercial.hitKeywords.length === 0 &&
+			!tweet.alreadyLikedAuthorToday &&
+			!tweet.authorRisk.isRejected,
+	);
+	let selected = ruleCandidates.slice(0, desiredLikes);
+
+	const aiEvaluated: Array<Record<string, unknown>> = [];
+	if (commit && selected.length < desiredLikes && aiEnabled && aiBudgetForRun > 0) {
+		const aiPool = inspectedTweets.filter((tweet) => {
+			if (tweet.sentiment.ok) return false;
+			if (tweet.sentiment.negativeHits.length > 0) return false;
+			if (tweet.commercial.hitKeywords.length > 0) return false;
+			if (tweet.alreadyLikedAuthorToday) return false;
+			if (tweet.authorRisk.isRejected) return false;
+			return true;
+		});
+		const aiNeed = desiredLikes - selected.length;
+		const aiTargets = aiPool.slice(0, Math.max(aiNeed, 1) + aiBudgetForRun - 1);
+		let aiUsedNow = 0;
+		for (const tweet of aiTargets) {
+			if (aiUsedNow >= aiBudgetForRun) break;
+			const aiResult = await evaluateXAutoLikeBoundaryWithAi({
+				text: tweet.text,
+				authorUsername: tweet.authorUsername,
+				env,
+				model: aiModel,
+			});
+			aiUsedNow += 1;
+			state.aiChecks += 1;
+			aiEvaluated.push({
+				tweetId: tweet.tweetId,
+				authorUsername: tweet.authorUsername,
+				ok: aiResult.ok,
+				reason: aiResult.reason ?? null,
+			});
+			if (aiResult.ok) {
+				selected.push(tweet);
+			}
+			if (selected.length >= desiredLikes) break;
+		}
+	}
+
+	const liked: Array<Record<string, unknown>> = [];
+	const failed: Array<Record<string, unknown>> = [];
+	const skipped = ruleCandidates.slice(desiredLikes).map((tweet) => ({
+		tweetId: tweet.tweetId,
+		authorId: tweet.authorId,
+		authorUsername: tweet.authorUsername,
+		reason: "run_limit",
+	}));
+
+	if (commit) {
+		for (const item of selected) {
+			const likeResult = await likeTweetOnX(accountId, item.tweetId, env);
+			if (likeResult.ok) {
+				liked.push({
+					tweetId: item.tweetId,
+					authorId: item.authorId,
+					authorUsername: item.authorUsername,
+					createdAt: item.createdAt,
+					positiveHits: item.sentiment.positiveHits,
+				});
+				state.count += 1;
+				state.likedIds.push(item.tweetId);
+				state.likedAuthorIds.push(item.authorId);
+			} else {
+				failed.push({
+					tweetId: item.tweetId,
+					authorId: item.authorId,
+					authorUsername: item.authorUsername,
+					status: likeResult.status,
+					error: likeResult.error ?? null,
+				});
+			}
+		}
+		state.likedIds = dedupePreserveLast(state.likedIds).slice(-500);
+		state.likedAuthorIds = dedupePreserveLast(state.likedAuthorIds).slice(-500);
+		await stateStore.put(stateKey, JSON.stringify(state));
+	}
+
+	const result = {
+		ok: true,
+		fromSchedule,
+		commitMode: commit,
+		enabled,
+		dateKey,
+		accountId,
+		accountUsername,
+		query,
+		dailyLimit,
+		likedToday: state.count,
+		remainingToday: Math.max(0, dailyLimit - state.count),
+		likedAuthorCountToday: state.likedAuthorIds.length,
+		maxLikesPerRun: maxPerRunResolved,
+		aiEnabled,
+		aiModel: aiEnabled ? aiModel : null,
+		aiDailyLimit,
+		aiChecksToday: state.aiChecks,
+		aiRemainingToday: Math.max(0, aiDailyLimit - state.aiChecks),
+		aiMaxPerRun,
+		aiBudgetForRun,
+		searchResultCount: search.tweets.length,
+		candidateCount: ruleCandidates.length,
+		selectedCount: selected.length,
+		likedCount: liked.length,
+		failedCount: failed.length,
+		selectedPreview: selected.map((item) => ({
+			tweetId: item.tweetId,
+			authorId: item.authorId,
+			authorUsername: item.authorUsername,
+			createdAt: item.createdAt,
+			positiveHits: item.sentiment.positiveHits,
+			commercialHits: item.commercial.hitKeywords,
+			authorRiskReason: item.authorRisk.reason,
+			text: fitToXWeightedLength(item.text.replace(/\s+/g, " ").trim(), 80),
+		})),
+		liked,
+		failed,
+		aiEvaluatedCount: aiEvaluated.length,
+		aiEvaluated,
+		skippedCount: skipped.length,
+	};
+	if (logToConsole) console.log(JSON.stringify({ type: "X_AUTO_LIKE_RESULT", ...result }, null, 2));
+	return result;
+}
+
+async function searchXRecentTweets(
+	query: string,
+	env: MonitorEnv,
+): Promise<{
+	ok: boolean;
+	status: number;
+	data?: unknown;
+	error?: string;
+	tweets: Array<{
+		id: string;
+		text: string;
+		authorId: string;
+		authorUsername: string | null;
+		createdAt: string | null;
+		authorCreatedAt: string | null;
+		authorDescription: string | null;
+	}>;
+}> {
+	const endpoint = new URL("https://api.x.com/2/tweets/search/recent");
+	endpoint.searchParams.set("query", query);
+	endpoint.searchParams.set("max_results", "30");
+	endpoint.searchParams.set("tweet.fields", "author_id,created_at,lang,text");
+	endpoint.searchParams.set("expansions", "author_id");
+	endpoint.searchParams.set("user.fields", "id,username,created_at,description");
+	const endpointUrl = endpoint.toString();
+
+	const authorization = await buildOAuth1Header({
+		method: "GET",
+		url: endpointUrl,
+		consumerKey: env.X_API_KEY ?? "",
+		consumerSecret: env.X_API_KEY_SECRET ?? "",
+		token: env.X_ACCESS_TOKEN ?? "",
+		tokenSecret: env.X_ACCESS_TOKEN_SECRET ?? "",
+	});
+
+	const res = await fetch(endpointUrl, {
+		method: "GET",
+		headers: {
+			Authorization: authorization,
+		},
+	});
+	const raw = await res.text();
+	let data: {
+		data?: Array<{ id?: string; text?: string; author_id?: string; created_at?: string }>;
+		includes?: { users?: Array<{ id?: string; username?: string; created_at?: string; description?: string }> };
+	} | { raw: string };
+	try {
+		data = JSON.parse(raw);
+	} catch {
+		data = { raw };
+	}
+	if (!res.ok) {
+		return {
+			ok: false,
+			status: res.status,
+			data,
+			error: "x_recent_search_failed",
+			tweets: [],
+		};
+	}
+
+	const users = new Map<string, { username: string; createdAt: string | null; description: string | null }>();
+	for (const user of (data as {
+		includes?: { users?: Array<{ id?: string; username?: string; created_at?: string; description?: string }> };
+	})?.includes
+		?.users ?? []) {
+		const id = String(user.id ?? "").trim();
+		const username = String(user.username ?? "").trim();
+		if (!id || !username) continue;
+		users.set(id, {
+			username,
+			createdAt: String(user.created_at ?? "").trim() || null,
+			description: String(user.description ?? "").trim() || null,
+		});
+	}
+	const tweets = ((data as { data?: Array<{ id?: string; text?: string; author_id?: string; created_at?: string }> })
+		.data ?? [])
+		.map((item) => {
+			const authorId = String(item.author_id ?? "").trim();
+			const user = users.get(authorId) ?? null;
+			return {
+				id: String(item.id ?? "").trim(),
+				text: String(item.text ?? ""),
+				authorId,
+				authorUsername: user?.username ?? null,
+				createdAt: String(item.created_at ?? "").trim() || null,
+				authorCreatedAt: user?.createdAt ?? null,
+				authorDescription: user?.description ?? null,
+			};
+		})
+		.filter((item) => item.id && item.text && item.authorId);
+	return {
+		ok: true,
+		status: res.status,
+		data,
+		tweets,
+	};
+}
+
+async function likeTweetOnX(
+	userId: string,
+	tweetId: string,
+	env: MonitorEnv,
+): Promise<Record<string, unknown> & { ok: boolean; status: number }> {
+	const endpoint = `https://api.x.com/2/users/${encodeURIComponent(userId)}/likes`;
+	const authorization = await buildOAuth1Header({
+		method: "POST",
+		url: endpoint,
+		consumerKey: env.X_API_KEY ?? "",
+		consumerSecret: env.X_API_KEY_SECRET ?? "",
+		token: env.X_ACCESS_TOKEN ?? "",
+		tokenSecret: env.X_ACCESS_TOKEN_SECRET ?? "",
+	});
+	const res = await fetch(endpoint, {
+		method: "POST",
+		headers: {
+			Authorization: authorization,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({ tweet_id: tweetId }),
+	});
+	const raw = await res.text();
+	let data: unknown = null;
+	try {
+		data = raw ? JSON.parse(raw) : {};
+	} catch {
+		data = { raw };
+	}
+	return {
+		ok: res.ok,
+		status: res.status,
+		data,
+	};
+}
+
+async function loadXAutoLikeState(
+	stateStore: StateStore,
+	key: string,
+	dateKey: string,
+): Promise<XAutoLikeState> {
+	const raw = await stateStore.get(key);
+	if (!raw) {
+		return {
+			dateKey,
+			count: 0,
+			likedIds: [],
+			likedAuthorIds: [],
+			aiChecks: 0,
+		};
+	}
+	try {
+		const parsed = JSON.parse(raw) as Partial<XAutoLikeState>;
+		const likedIds = Array.isArray(parsed.likedIds) ? parsed.likedIds.map((id) => String(id)).filter(Boolean) : [];
+		const likedAuthorIds = Array.isArray(parsed.likedAuthorIds)
+			? parsed.likedAuthorIds.map((id) => String(id)).filter(Boolean)
+			: [];
+		return {
+			dateKey,
+			count: Number.isFinite(Number(parsed.count)) ? Math.max(0, Math.trunc(Number(parsed.count))) : 0,
+			likedIds,
+			likedAuthorIds,
+			aiChecks: Number.isFinite(Number(parsed.aiChecks)) ? Math.max(0, Math.trunc(Number(parsed.aiChecks))) : 0,
+		};
+	} catch {
+		return {
+			dateKey,
+			count: 0,
+			likedIds: [],
+			likedAuthorIds: [],
+			aiChecks: 0,
+		};
+	}
+}
+
+function dedupePreserveLast(values: string[]): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (let i = values.length - 1; i >= 0; i--) {
+		const value = String(values[i] ?? "").trim();
+		if (!value || seen.has(value)) continue;
+		seen.add(value);
+		out.push(value);
+	}
+	out.reverse();
+	return out;
+}
+
+function evaluateXAutoLikeSentiment(text: string): { ok: boolean; positiveHits: string[]; negativeHits: string[] } {
+	const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
+	const lower = normalized.toLowerCase();
+	const positiveHits = X_AUTO_LIKE_POSITIVE_KEYWORDS.filter((word) => normalized.includes(word));
+	const negativeHits = X_AUTO_LIKE_NEGATIVE_KEYWORDS.filter(
+		(word) => normalized.includes(word) || lower.includes(word.toLowerCase()),
+	);
+	if (negativeHits.length > 0) {
+		return { ok: false, positiveHits, negativeHits };
+	}
+	if (positiveHits.length === 0) {
+		return { ok: false, positiveHits, negativeHits };
+	}
+	if (/https?:\/\/\S+/i.test(normalized) && !/開封|当たっ|ゲット|嬉し|うれし/i.test(normalized)) {
+		return { ok: false, positiveHits, negativeHits };
+	}
+	return { ok: true, positiveHits, negativeHits };
+}
+
+function evaluateXAutoLikeCommercial(
+	text: string,
+	authorUsername: string | null,
+): { hitKeywords: string[] } {
+	const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
+	const username = String(authorUsername ?? "").trim().toLowerCase();
+	const hitKeywords = X_AUTO_LIKE_COMMERCIAL_KEYWORDS.filter((word) => {
+		const lowerWord = word.toLowerCase();
+		return normalized.includes(word) || username.includes(lowerWord);
+	});
+	return { hitKeywords };
+}
+
+function evaluateXAutoLikeAuthorRisk(params: {
+	authorUsername: string | null;
+	authorDescription: string | null;
+	authorCreatedAt: string | null;
+}): { isRejected: boolean; reason: string | null } {
+	const username = String(params.authorUsername ?? "").trim().toLowerCase();
+	const description = String(params.authorDescription ?? "").trim();
+	const descriptionLower = description.toLowerCase();
+
+	const createdAtRaw = String(params.authorCreatedAt ?? "").trim();
+	const createdAt = createdAtRaw ? new Date(createdAtRaw) : null;
+	if (createdAt && Number.isFinite(createdAt.getTime())) {
+		const ageDays = Math.floor((Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24));
+		if (ageDays >= 0 && ageDays < X_AUTO_LIKE_NEW_ACCOUNT_DAYS) {
+			return { isRejected: true, reason: `new_account_${ageDays}d` };
+		}
+	}
+
+	const commercialProfileWords = X_AUTO_LIKE_COMMERCIAL_KEYWORDS.filter((word) => {
+		const w = word.toLowerCase();
+		return username.includes(w) || description.includes(word) || descriptionLower.includes(w);
+	});
+	if (commercialProfileWords.length > 0) {
+		return { isRejected: true, reason: `commercial_profile:${commercialProfileWords[0]}` };
+	}
+
+	return { isRejected: false, reason: null };
+}
+
+async function evaluateXAutoLikeBoundaryWithAi(params: {
+	text: string;
+	authorUsername: string | null;
+	env: MonitorEnv;
+	model: string;
+}): Promise<{ ok: boolean; reason?: string }> {
+	const { text, authorUsername, env, model } = params;
+	if (!env.ANTHROPIC_API_KEY) return { ok: false, reason: "missing_anthropic_api_key" };
+	const prompt = [
+		"次の投稿に公式アカウントが「いいね」して問題ないかを判定してください。",
+		"目的はフォロー獲得。個人のポジティブ体験はOK、販売/買取宣伝やネガティブはNGです。",
+		"出力はJSONのみ: {\"decision\":\"like\"|\"skip\",\"reason\":\"短く\"}",
+		"",
+		`author_username: ${String(authorUsername ?? "")}`,
+		`text: ${String(text ?? "").slice(0, 500)}`,
+	].join("\n");
+	const response = await callAnthropicTextGeneration({
+		system: "SNS運用の判定者。JSONのみで返答する。",
+		prompt,
+		apiKey: env.ANTHROPIC_API_KEY,
+		model,
+	});
+	if (!response.ok || !response.text) {
+		return { ok: false, reason: response.reason ?? "anthropic_failed" };
+	}
+	const raw = response.text.trim();
+	const normalized = raw.replace(/```json|```/gi, "").trim();
+	try {
+		const parsed = JSON.parse(normalized) as { decision?: string; reason?: string };
+		const decision = String(parsed.decision ?? "").trim().toLowerCase();
+		if (decision === "like") return { ok: true, reason: String(parsed.reason ?? "").trim() || "ai_like" };
+		return { ok: false, reason: String(parsed.reason ?? "").trim() || "ai_skip" };
+	} catch {
+		if (/\"decision\"\s*:\s*\"like\"/i.test(normalized) || /\blike\b/i.test(normalized)) {
+			return { ok: true, reason: "ai_like_text" };
+		}
+		return { ok: false, reason: "ai_parse_failed" };
+	}
+}
+
+async function uploadImageBlobToX(
+	imageBlob: Blob,
+	env: MonitorEnv,
+): Promise<Record<string, unknown> & { ok: boolean; status: number; mediaId?: string }> {
+	const endpoint = "https://upload.twitter.com/1.1/media/upload.json";
+	const form = new FormData();
+	form.append("media", imageBlob, "pokeca-summary-collage.png");
+
+	const authorization = await buildOAuth1Header({
+		method: "POST",
+		url: endpoint,
+		consumerKey: env.X_API_KEY ?? "",
+		consumerSecret: env.X_API_KEY_SECRET ?? "",
+		token: env.X_ACCESS_TOKEN ?? "",
+		tokenSecret: env.X_ACCESS_TOKEN_SECRET ?? "",
+	});
+
+	const res = await fetch(endpoint, {
+		method: "POST",
+		headers: {
+			Authorization: authorization,
+		},
+		body: form,
+	});
+
+	const raw = await res.text();
+	let data: Record<string, unknown>;
+	try {
+		data = JSON.parse(raw);
+	} catch {
+		data = { raw };
+	}
+
+	if (!res.ok) {
+		return {
+			ok: false,
+			status: res.status,
+			data,
+		};
+	}
+
+	return {
+		ok: true,
+		status: res.status,
+		mediaId: String(data.media_id_string ?? ""),
 	};
 }
 
@@ -5395,6 +8200,7 @@ async function fetchMercariItemDetail(url: string): Promise<ItemDetail> {
 	const hasLastOnePrize =
 		text.includes("ラスイチ") || text.includes("ラストワン") || text.includes("最後の1枚");
 	const topPrizeNames = extractMercariTopPrizeNames(html, text);
+	const lastOnePrizeName = extractMercariLastOnePrizeName(html, text);
 
 	const imageUrls = extractImageUrls(html, "https://nft.jp.mercari.com");
 	const ogImageUrl = extractOgImageUrl(html, "https://nft.jp.mercari.com");
@@ -5419,6 +8225,7 @@ async function fetchMercariItemDetail(url: string): Promise<ItemDetail> {
 		hasLastOnePrize,
 		detailTextHint: text.slice(0, 400),
 		topPrizeNames,
+		lastOnePrizeName,
 		mainImageUrl,
 		lastOneImageUrl,
 		imageUrls: imageUrls.slice(0, 10),
@@ -5461,6 +8268,7 @@ async function fetchTcgStoreItemDetail(url: string): Promise<ItemDetail> {
 	if (lastPrizeBlock?.[1]) {
 		lastOneImageUrl = normalizeUrl(lastPrizeBlock[1], "https://tcgstore.io");
 	}
+	const lastOnePrizeName = extractTcgStoreLastPrizeName(html, text);
 
 	const extractedTitle = extractKujiTitleFromHtml(html);
 
@@ -5473,6 +8281,7 @@ async function fetchTcgStoreItemDetail(url: string): Promise<ItemDetail> {
 		hasLastOnePrize: Boolean(lastOneImageUrl),
 		detailTextHint: text.slice(0, 400),
 		topPrizeNames: [],
+		lastOnePrizeName,
 		mainImageUrl,
 		lastOneImageUrl,
 		imageUrls: imageUrls.slice(0, 10),
@@ -5547,6 +8356,52 @@ function extractMercariTopPrizeNames(html: string, plainText: string): string[] 
 		if (names.length >= 6) break;
 	}
 	return names;
+}
+
+function extractMercariLastOnePrizeName(html: string, plainText: string): string | null {
+	const text = String(plainText ?? "").replace(/\s+/g, " ");
+	const textPatterns = [
+		/ラスイチ賞\s*[:：]?\s*([^。]{1,120}?)(?=(?:[A-Z]賞|[0-9]等|残り|\/|¥|$))/u,
+		/ラストワン賞\s*[:：]?\s*([^。]{1,120}?)(?=(?:[A-Z]賞|[0-9]等|残り|\/|¥|$))/u,
+	];
+	for (const pattern of textPatterns) {
+		const match = text.match(pattern);
+		const cleaned = sanitizeCardNameForPost(String(match?.[1] ?? "")).trim();
+		if (cleaned && cleaned.length >= 2) return cleaned.slice(0, 40);
+	}
+	const htmlPatterns = [
+		/ラスイチ賞[\s\S]{0,1600}?<img[^>]+alt="([^"]+)"/iu,
+		/ラストワン賞[\s\S]{0,1600}?<img[^>]+alt="([^"]+)"/iu,
+	];
+	for (const pattern of htmlPatterns) {
+		const match = html.match(pattern);
+		const cleaned = sanitizeCardNameForPost(decodeHtmlEntities(String(match?.[1] ?? ""))).trim();
+		if (cleaned && cleaned.length >= 2) return cleaned.slice(0, 40);
+	}
+	return null;
+}
+
+function extractTcgStoreLastPrizeName(html: string, plainText: string): string | null {
+	const text = String(plainText ?? "").replace(/\s+/g, " ");
+	const textPatterns = [
+		/ラスト賞\s*[:：]?\s*([^。]{1,120}?)(?=(?:[A-Z]賞|[0-9]等|残り|\/|¥|$))/u,
+		/LAST\s*PRIZE\s*[:：]?\s*([^。]{1,120}?)(?=(?:[A-Z]賞|[0-9]等|残り|\/|¥|$))/iu,
+	];
+	for (const pattern of textPatterns) {
+		const match = text.match(pattern);
+		const cleaned = sanitizeCardNameForPost(String(match?.[1] ?? "")).trim();
+		if (cleaned && cleaned.length >= 2) return cleaned.slice(0, 40);
+	}
+	const htmlPatterns = [
+		/ラスト賞[\s\S]{0,1800}?<img[^>]+alt=["']([^"']+)["']/iu,
+		/LAST[\s\S]{0,1800}?<img[^>]+alt=["']([^"']+)["']/iu,
+	];
+	for (const pattern of htmlPatterns) {
+		const match = html.match(pattern);
+		const cleaned = sanitizeCardNameForPost(decodeHtmlEntities(String(match?.[1] ?? ""))).trim();
+		if (cleaned && cleaned.length >= 2) return cleaned.slice(0, 40);
+	}
+	return null;
 }
 
 function extractTcgStoreCandidateItems(html: string): CandidateItem[] {
@@ -5758,8 +8613,8 @@ function buildMercariDailyImageAlt(
 	return `${title} | 1等候補: ${topPrizeText} | ${remainText}`.slice(0, 1000);
 }
 
-function buildThresholdAlertImageAlt(title: string, topPrizeNames: string[]): string {
-	const prizeText = topPrizeNames.length > 0 ? topPrizeNames.slice(0, 3).join(" / ") : "未取得";
+function buildThresholdAlertImageAlt(title: string, lastOnePrizeName: string | null): string {
+	const prizeText = sanitizeCardNameForPost(lastOnePrizeName ?? "").trim() || "名称未取得";
 	return `${title} | ラスト賞: ${prizeText}`.slice(0, 1000);
 }
 

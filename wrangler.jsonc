@@ -46,7 +46,16 @@
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/
 	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
+	"vars": {
+		"X_AUTO_LIKE_ENABLED": "true",
+		"X_AUTO_LIKE_DAILY_LIMIT": "24",
+		"X_AUTO_LIKE_MAX_PER_RUN": "1",
+		"X_AUTO_LIKE_QUERY": "(ポケカ OR ポケモンカード) (開封 OR 当たった OR 嬉しい OR うれしい OR 引けた OR 買えた OR ゲット) -買取 -販売 -入荷 -予約 -在庫 -PR -キャンペーン -is:retweet -is:reply lang:ja",
+		"X_AUTO_LIKE_AI_ENABLED": "true",
+		"X_AUTO_LIKE_AI_DAILY_LIMIT": "8",
+		"X_AUTO_LIKE_AI_MAX_PER_RUN": "2",
+		"X_AUTO_LIKE_AI_MODEL": "claude-3-5-haiku-latest"
+	}
 	/**
 	 * Static Assets
 	 * https://developers.cloudflare.com/workers/static-assets/binding/
