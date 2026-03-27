@@ -55,7 +55,7 @@ const html = `<!doctype html>
     margin:0;
     padding:0;
     width:600px;
-    height:459px;
+    height:479px;
     overflow:hidden;
     background: transparent;
   }
@@ -63,7 +63,7 @@ const html = `<!doctype html>
   .root {
     position: relative;
     width: 600px;
-    height: 459px;
+    height: 479px;
     background: linear-gradient(119.05deg, #FF732E 0%, #FA4573 52%, #5E54F2 100%);
     font-family: Inter, 'Hiragino Kaku Gothic ProN', sans-serif;
   }
@@ -113,15 +113,15 @@ const html = `<!doctype html>
     line-height:44px;
     color:#fff;
   }
-  .r1 { left:76px; top:111.5px; }
-  .r2 { left:267.5px; top:111.5px; }
-  .r3 { left:452.5px; top:111.5px; }
+  .r1 { left:76px; top:131.5px; }
+  .r2 { left:267.5px; top:131.5px; }
+  .r3 { left:452.5px; top:131.5px; }
 
   .slot {
     position:absolute;
     width:170px;
     height:242px;
-    top:156px;
+    top:176px;
     background:rgba(255,255,255,0.9);
     border-radius:12px;
     box-shadow: 0 6px 16px rgba(26,8,51,.28);
@@ -142,7 +142,7 @@ const html = `<!doctype html>
   .hash {
     position:absolute;
     left:26px;
-    top:422.5px;
+    top:442.5px;
     font-weight:700;
     font-size:20px;
     line-height:24px;
@@ -153,7 +153,7 @@ const html = `<!doctype html>
     width:156px;
     height:22px;
     left:413px;
-    top:422.5px;
+    top:442.5px;
   }
   .dot { position:absolute; border-radius:999px; }
   .d1{width:10px;height:10px;left:16px;top:138px;background:rgba(252,230,64,.9)}
@@ -193,7 +193,7 @@ await execFileAsync(chrome, [
   '--disable-gpu',
   '--hide-scrollbars',
   '--force-device-scale-factor=2',
-  '--window-size=600,459',
+  '--window-size=600,479',
   '--virtual-time-budget=5000',
   `--screenshot=${outPath}`,
   `file://${htmlPath}`,

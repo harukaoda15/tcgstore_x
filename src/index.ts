@@ -2147,6 +2147,10 @@ function resolvePokecaRankTarget(
 	return { rankTarget: "rank_rise_7", rankSource: "default" };
 }
 
+function isDirectionalPokecaRankTarget(rankTarget: PokecaRankTarget): boolean {
+	return rankTarget === "rank_rise_7" || rankTarget === "rank_fall_7";
+}
+
 async function getPokecaThemeHistory(stateStore: StateStore): Promise<PokecaRankTarget[]> {
 	const raw = await stateStore.get(POKECA_SUMMARY_THEME_HISTORY_KEY);
 	if (!raw) return [];
@@ -2609,9 +2613,9 @@ async function renderPokecaBannerViaSvgResvg(
 	const fontBuffers = await loadPokecaBannerFontBuffers();
 
 	const slots = [
-		{ x: 21.5, y: 156, w: 170, h: 242 },
-		{ x: 210, y: 156, w: 170, h: 242 },
-		{ x: 398.5, y: 156, w: 170, h: 242 },
+		{ x: 21.5, y: 176, w: 170, h: 242 },
+		{ x: 210, y: 176, w: 170, h: 242 },
+		{ x: 398.5, y: 176, w: 170, h: 242 },
 	];
 
 	const clipDefs = embeddedImages
@@ -2639,9 +2643,9 @@ async function renderPokecaBannerViaSvgResvg(
 	const logoDataUrl = `data:image/svg+xml;base64,${utf8ToBase64(TCGSTORE_LOGO_SVG)}`;
 
 	const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="600" height="459" viewBox="0 0 600 459">
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="479" viewBox="0 0 600 479">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="600" y2="459" gradientUnits="userSpaceOnUse">
+    <linearGradient id="bg" x1="0" y1="0" x2="600" y2="479" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FF732E"/>
       <stop offset="52%" stop-color="#FA4573"/>
       <stop offset="100%" stop-color="#5E54F2"/>
@@ -2657,20 +2661,20 @@ async function renderPokecaBannerViaSvgResvg(
     </filter>
     ${clipDefs}
   </defs>
-  <rect x="0" y="0" width="600" height="459" fill="url(#bg)"/>
+  <rect x="0" y="0" width="600" height="479" fill="url(#bg)"/>
   <ellipse cx="50" cy="20" rx="90" ry="90" fill="rgba(255,242,115,0.45)" filter="url(#blur12)"/>
   <ellipse cx="345" cy="55" rx="95" ry="95" fill="rgba(89,242,255,0.35)" filter="url(#blur15)"/>
-  <ellipse cx="235" cy="430" rx="115" ry="90" fill="rgba(255,115,191,0.28)" filter="url(#blur14)"/>
+  <ellipse cx="235" cy="450" rx="115" ry="90" fill="rgba(255,115,191,0.28)" filter="url(#blur14)"/>
   <rect x="20" y="18" width="549" height="86" rx="18" ry="18" fill="rgba(40,0,81,0.17)" stroke="rgba(255,255,255,0.36)"/>
   <text x="300" y="54" fill="#FFFFFF" text-anchor="middle" font-size="25" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">${escapeXmlText(title || "フリマ取引件数ランキング")}</text>
   <text x="300" y="82" fill="#FFF7D1" text-anchor="middle" font-size="15" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">注目カードはこちら！</text>
-  <text x="76" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">1st</text>
-  <text x="267.5" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">2nd</text>
-  <text x="452.5" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">3rd</text>
+  <text x="76" y="162" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">1st</text>
+  <text x="267.5" y="162" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">2nd</text>
+  <text x="452.5" y="162" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">3rd</text>
   ${slotRects}
   ${cardLayers}
-  <text x="26" y="437" fill="#FFFFFF" font-size="20" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">#ポケカ</text>
-  <image href="${logoDataUrl}" x="413" y="412.5" width="156" height="22"/>
+  <text x="26" y="457" fill="#FFFFFF" font-size="20" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">#ポケカ</text>
+  <image href="${logoDataUrl}" x="413" y="432.5" width="156" height="22"/>
 </svg>`;
 
 	try {
@@ -2739,7 +2743,7 @@ async function buildPokecaSummaryCollageImage(
 		const scale = 2;
 		const sx = (v: number) => Math.round(v * scale);
 		const width = sx(600);
-		const height = sx(459);
+		const height = sx(479);
 		const canvas = new OffscreenCanvasCtor(width, height);
 		const ctx = canvas.getContext("2d");
 		if (!ctx) return null;
@@ -2762,7 +2766,7 @@ async function buildPokecaSummaryCollageImage(
 		glowB.addColorStop(1, "rgba(89,242,255,0)");
 		ctx.fillStyle = glowB;
 		ctx.fillRect(0, 0, width, height);
-		const glowC = ctx.createRadialGradient(sx(235), sx(540), sx(15), sx(235), sx(540), sx(140));
+		const glowC = ctx.createRadialGradient(sx(235), sx(560), sx(15), sx(235), sx(560), sx(140));
 		glowC.addColorStop(0, "rgba(255,115,191,0.28)");
 		glowC.addColorStop(1, "rgba(255,115,191,0)");
 		ctx.fillStyle = glowC;
@@ -2794,14 +2798,14 @@ async function buildPokecaSummaryCollageImage(
 		ctx.textAlign = "left";
 		ctx.textBaseline = "top";
 		ctx.font = `700 ${sx(30)}px "Space Mono", monospace`;
-		ctx.fillText("1st", sx(76), sx(112));
-		ctx.fillText("2nd", sx(267.5), sx(112));
-		ctx.fillText("3rd", sx(452.5), sx(112));
+		ctx.fillText("1st", sx(76), sx(132));
+		ctx.fillText("2nd", sx(267.5), sx(132));
+		ctx.fillText("3rd", sx(452.5), sx(132));
 
 		const slots = [
-			{ x: sx(21.5), y: sx(156), w: sx(170), h: sx(242) },
-			{ x: sx(210), y: sx(156), w: sx(170), h: sx(242) },
-			{ x: sx(398.5), y: sx(156), w: sx(170), h: sx(242) },
+			{ x: sx(21.5), y: sx(176), w: sx(170), h: sx(242) },
+			{ x: sx(210), y: sx(176), w: sx(170), h: sx(242) },
+			{ x: sx(398.5), y: sx(176), w: sx(170), h: sx(242) },
 		];
 		for (let i = 0; i < bitmaps.length; i += 1) {
 			const slot = slots[i];
@@ -2846,14 +2850,14 @@ async function buildPokecaSummaryCollageImage(
 		ctx.textAlign = "left";
 		ctx.textBaseline = "top";
 		ctx.font = `700 ${sx(20)}px Inter, "Noto Sans CJK JP", sans-serif`;
-		ctx.fillText("#ポケカ", sx(26), sx(412.5));
+		ctx.fillText("#ポケカ", sx(26), sx(432.5));
 		if (logoBitmap) {
-			ctx.drawImage(logoBitmap, sx(413), sx(412.5), sx(156), sx(22));
+			ctx.drawImage(logoBitmap, sx(413), sx(432.5), sx(156), sx(22));
 			if (typeof logoBitmap.close === "function") logoBitmap.close();
 		} else {
 			ctx.textAlign = "right";
 			ctx.font = `700 ${sx(20)}px "Space Mono", Inter, sans-serif`;
-			ctx.fillText("TCGSTORE", sx(569), sx(412.5));
+			ctx.fillText("TCGSTORE", sx(569), sx(432.5));
 		}
 
 		const out = await canvas.convertToBlob({ type: "image/png", quality: 0.92 });
@@ -2919,6 +2923,11 @@ function buildPokecaConsecutiveRankLine(
 	entries: PokecaConsecutiveRankIn[],
 	rankLabel: string,
 ): string | null {
+	// 外部ランキング由来と誤解されやすいため、連続ランクイン行は一旦非表示にする。
+	void entries;
+	void rankLabel;
+	return null;
+	/*
 	const rankTag = rankLabel.includes("下落")
 		? "下落7日"
 		: rankLabel.includes("高騰")
@@ -2933,6 +2942,7 @@ function buildPokecaConsecutiveRankLine(
 		.map((entry) => `${stripPokecaCardVariant(entry.cardName)}(${entry.yesterdayRank}→${entry.todayRank}位)`)
 		.join("、");
 	return `${header}: ${body}`;
+	*/
 }
 
 function formatYmdMonthDay(ymd: string): string {
@@ -3660,6 +3670,9 @@ async function runPokecaSummary(
 			rankTarget = aiPick.rankTarget;
 			rankSource = "ai_theme";
 		}
+		// 直近要望: 上昇/下落テーマを一旦避け、取引件数テーマを優先する。
+		rankTarget = "rank_vol";
+		rankSource = "ai_theme";
 	}
 	const rankLabel = getPokecaRankLabel(rankTarget);
 	const kvKey = getPokecaSummaryDailyKey(dateKey, rankTarget);
