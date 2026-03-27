@@ -2517,6 +2517,8 @@ async function loadPokecaBannerFontBuffers(): Promise<Uint8Array[]> {
 	if (pokecaBannerFontBuffersPromise) return pokecaBannerFontBuffersPromise;
 	pokecaBannerFontBuffersPromise = (async () => {
 		const urls = [
+			"https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter-Bold.ttf",
+			"https://raw.githubusercontent.com/google/fonts/main/ofl/spacemono/SpaceMono-Bold.ttf",
 			"https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf",
 			"https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/Japanese/NotoSansCJKjp-Bold.otf",
 		];
@@ -2621,28 +2623,37 @@ async function renderPokecaBannerViaSvgResvg(
 	const logoDataUrl = `data:image/svg+xml;base64,${utf8ToBase64(TCGSTORE_LOGO_SVG)}`;
 
 	const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="600" height="459" viewBox="0 0 600 459">
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="574" viewBox="0 0 600 574">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="600" y2="459" gradientUnits="userSpaceOnUse">
+    <linearGradient id="bg" x1="0" y1="0" x2="600" y2="574" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FF732E"/>
       <stop offset="52%" stop-color="#FA4573"/>
       <stop offset="100%" stop-color="#5E54F2"/>
     </linearGradient>
+    <filter id="blur12" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+    <filter id="blur14" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <filter id="blur15" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="15"/>
+    </filter>
     ${clipDefs}
   </defs>
-  <rect x="0" y="0" width="600" height="459" fill="url(#bg)"/>
-  <ellipse cx="50" cy="20" rx="90" ry="90" fill="rgba(255,242,115,0.45)"/>
-  <ellipse cx="345" cy="55" rx="95" ry="95" fill="rgba(89,242,255,0.35)"/>
-  <ellipse cx="235" cy="430" rx="115" ry="90" fill="rgba(255,115,191,0.28)"/>
+  <rect x="0" y="0" width="600" height="574" fill="url(#bg)"/>
+  <ellipse cx="50" cy="20" rx="90" ry="90" fill="rgba(255,242,115,0.45)" filter="url(#blur12)"/>
+  <ellipse cx="345" cy="55" rx="95" ry="95" fill="rgba(89,242,255,0.35)" filter="url(#blur15)"/>
+  <ellipse cx="235" cy="560" rx="115" ry="90" fill="rgba(255,115,191,0.28)" filter="url(#blur14)"/>
   <rect x="20" y="18" width="549" height="86" rx="18" ry="18" fill="rgba(40,0,81,0.17)" stroke="rgba(255,255,255,0.36)"/>
-  <text x="300" y="54" fill="#FFFFFF" text-anchor="middle" font-size="25" font-weight="700" font-family="Inter, sans-serif">${escapeXmlText(title || "フリマ取引件数ランキング")}</text>
-  <text x="300" y="82" fill="#FFF7D1" text-anchor="middle" font-size="15" font-weight="700" font-family="Inter, sans-serif">注目カードはこちら！</text>
+  <text x="300" y="54" fill="#FFFFFF" text-anchor="middle" font-size="25" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">${escapeXmlText(title || "フリマ取引件数ランキング")}</text>
+  <text x="300" y="82" fill="#FFF7D1" text-anchor="middle" font-size="15" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">注目カードはこちら！</text>
   <text x="76" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">1st</text>
   <text x="267.5" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">2nd</text>
   <text x="452.5" y="142" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Space Mono, monospace">3rd</text>
   ${slotRects}
   ${cardLayers}
-  <text x="26" y="437" fill="#FFFFFF" font-size="20" font-weight="700" font-family="Inter, sans-serif">#ポケカ</text>
+  <text x="26" y="437" fill="#FFFFFF" font-size="20" font-weight="700" font-family="Inter, Noto Sans CJK JP, sans-serif">#ポケカ</text>
   <image href="${logoDataUrl}" x="413" y="412.5" width="156" height="22"/>
 </svg>`;
 
@@ -2712,13 +2723,13 @@ async function buildPokecaSummaryCollageImage(
 		const scale = 2;
 		const sx = (v: number) => Math.round(v * scale);
 		const width = sx(600);
-		const height = sx(459);
+		const height = sx(574);
 		const canvas = new OffscreenCanvasCtor(width, height);
 		const ctx = canvas.getContext("2d");
 		if (!ctx) return null;
 
 		const gradient = ctx.createLinearGradient(0, 0, width, height);
-		gradient.addColorStop(0, "#ff7330");
+		gradient.addColorStop(0, "#ff732e");
 		gradient.addColorStop(0.52, "#fa4573");
 		gradient.addColorStop(1, "#5e54f2");
 		ctx.fillStyle = gradient;
@@ -2754,12 +2765,12 @@ async function buildPokecaSummaryCollageImage(
 		ctx.stroke();
 
 		ctx.fillStyle = "#ffffff";
-		ctx.font = `700 ${sx(25)}px Inter, sans-serif`;
+		ctx.font = `700 ${sx(25)}px Inter, "Noto Sans CJK JP", sans-serif`;
 		ctx.textBaseline = "middle";
 		ctx.textAlign = "center";
 		ctx.fillText("フリマ取引件数ランキング", width / 2, sx(50));
 		ctx.fillStyle = "#fff7d1";
-		ctx.font = `700 ${sx(15)}px Inter, sans-serif`;
+		ctx.font = `700 ${sx(15)}px Inter, "Noto Sans CJK JP", sans-serif`;
 		ctx.fillText("注目カードはこちら！", width / 2, sx(79));
 
 		// rank labels
@@ -2818,7 +2829,7 @@ async function buildPokecaSummaryCollageImage(
 		ctx.fillStyle = "#ffffff";
 		ctx.textAlign = "left";
 		ctx.textBaseline = "top";
-		ctx.font = `700 ${sx(20)}px Inter, sans-serif`;
+		ctx.font = `700 ${sx(20)}px Inter, "Noto Sans CJK JP", sans-serif`;
 		ctx.fillText("#ポケカ", sx(26), sx(412.5));
 		if (logoBitmap) {
 			ctx.drawImage(logoBitmap, sx(413), sx(412.5), sx(156), sx(22));
